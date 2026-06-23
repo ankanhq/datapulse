@@ -1,0 +1,24 @@
+# Render Blueprint — auto-configures the DataPulse backend when you connect this
+# repo to Render (New + Blueprint). Render reads this file instead of you setting
+# everything by hand in the dashboard.
+#
+# Assumes this repo's root contains the Dockerfile (i.e. you pushed the contents
+# of ~/datapulse as the repo root). If the backend lives in a subfolder, set
+# dockerfilePath/dockerContext to that folder, e.g. ./datapulse/Dockerfile.
+services:
+  - type: web
+    name: datapulse-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /
+    envVars:
+      # Set this in the Render dashboard to your deployed frontend URL, e.g.
+      # https://datapulse-frontend.vercel.app (comma-separate multiple origins).
+      # sync:false = Render prompts for it and does not store it in this file.
+      - key: DATAPULSE_CORS_ORIGINS
+        sync: false
+      # Optional: query Parquet from disk instead of loading into RAM.
+      # - key: DATAPULSE_USE_PARQUET
+      #   value: "1"

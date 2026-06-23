@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+.tmp/
+*.csv
+*.parquet
+.git/
+.gitignore
+README.md
+DEPLOY.md
