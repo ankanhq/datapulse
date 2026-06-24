@@ -357,19 +357,49 @@ def root() -> dict[str, Any]:
     return {"message": "DataPulse API is running", "active_datasets": len(_registry)}
 
 
-@app.post("/datasets")
-async def upload_dataset(file: UploadFile = File(...)) -> dict[str, Any]:
-    """Receive a CSV upload, load it into an isolated table, return id + schema."""
-    filename = file.filename or "upload.csv"
-    if not filename.lower().endswith((".csv", ".tsv", ".txt")):
+def _excel_to_csv(src_path: str) -> str:
+    """Read the first sheet of an Excel file and write it to a temp CSV path.
+
+    By converting to CSV and then feeding it through the same read_csv_auto
+    path as a normal upload, Excel files get byte-for-byte identical column
+    detection, table, chart and export behaviour. pandas is imported lazily so
+    the dependency is only loaded when an Excel file is actually uploaded.
+    """
+    import pandas as pd  # lazy: keeps base memory/startup low for the CSV path
+
+    try:
+        # sheet_name=0 -> first sheet. Engine is chosen from the file extension
+        # (openpyxl for .xlsx, xlrd for legacy .xls).
+        df = pd.read_excel(src_path, sheet_name=0)
+    except Exception as exc:  # noqa: BLE001 - any read failure -> friendly 400
         raise HTTPException(
             status_code=400,
-            detail="Please upload a .csv file.",
+            detail=f"Could not read this Excel file. {str(exc).splitlines()[0]}",
+        ) from exc
+
+    csv_tmp = tempfile.NamedTemporaryFile(prefix="datapulse_", suffix=".csv", delete=False)
+    csv_tmp.close()
+    df.to_csv(csv_tmp.name, index=False)
+    return csv_tmp.name
+
+
+@app.post("/datasets")
+async def upload_dataset(file: UploadFile = File(...)) -> dict[str, Any]:
+    """Receive a CSV or Excel upload, load it into an isolated table, return id + schema."""
+    filename = file.filename or "upload.csv"
+    lower = filename.lower()
+    is_excel = lower.endswith((".xlsx", ".xls"))
+    if not (is_excel or lower.endswith((".csv", ".tsv", ".txt"))):
+        raise HTTPException(
+            status_code=400,
+            detail="Please upload a CSV or Excel file (.csv, .xlsx, .xls).",
         )
 
     # Stream to a temp file, enforcing the size cap as we go (never trust the
-    # client's Content-Length). The temp file is deleted right after loading.
-    tmp = tempfile.NamedTemporaryFile(prefix="datapulse_", suffix=".csv", delete=False)
+    # client's Content-Length). Temp files are deleted right after loading.
+    suffix = os.path.splitext(filename)[1] or ".csv"
+    tmp = tempfile.NamedTemporaryFile(prefix="datapulse_", suffix=suffix, delete=False)
+    cleanup = [tmp.name]
     size = 0
     try:
         while True:
@@ -389,13 +419,20 @@ async def upload_dataset(file: UploadFile = File(...)) -> dict[str, Any]:
         if size == 0:
             raise HTTPException(status_code=400, detail="The uploaded file is empty.")
 
-        ds = _create_dataset(tmp.name, name=filename, source="upload")
+        if is_excel:
+            load_path = _excel_to_csv(tmp.name)
+            cleanup.append(load_path)
+        else:
+            load_path = tmp.name
+
+        ds = _create_dataset(load_path, name=filename, source="upload")
         return ds.public()
     finally:
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
+        for path in cleanup:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 
 class PasteRequest(BaseModel):
