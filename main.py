@@ -1,8 +1,11 @@
-"""DataPulse API — a high-performance local analytics engine.
+"""DataPulse API — a free, self-serve CSV analytics engine.
 
-FastAPI + DuckDB. The 10M-row CSV is loaded into an in-memory DuckDB table
-*once* at startup (rather than re-parsed on every request), so analytical
-queries over the full dataset return in milliseconds.
+FastAPI + DuckDB. Any visitor uploads a CSV; it is parsed into an isolated,
+per-dataset in-memory DuckDB table and explored through generic endpoints that
+adapt to whatever columns the file has. Nothing is persisted to disk: uploads
+live in memory only, keyed by an opaque dataset id, and are evicted once the
+process is holding too many or they go stale — which keeps memory bounded on a
+free-tier host and means one visitor never sees another's data.
 
 Run with:
     uvicorn main:app --reload
@@ -12,157 +15,128 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import os
+import tempfile
+import threading
+import time
+import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import date, datetime
 from typing import Any, Iterator, Optional
 
 import duckdb
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-# Data file path comes from the environment so deployments can point at a
-# smaller production dataset (e.g. ./data_100k.csv) without code changes.
-# Defaults to the local 10M-row dev file.
-DATA_FILE_PATH = os.getenv("DATAPULSE_DATA_FILE", "./data_10m.csv")
-# The Parquet path defaults to the data file with a .parquet extension (so a
-# data file of ./data_100k.csv yields ./data_100k.parquet), overridable on its
-# own. This keeps CSV- and Parquet-mode artefacts paired per dataset.
-PARQUET_FILE_PATH = os.getenv(
-    "DATAPULSE_PARQUET_FILE",
-    os.path.splitext(DATA_FILE_PATH)[0] + ".parquet",
-)
-TABLE_NAME = "data"
+# ---------------------------------------------------------------------------
+# Configuration (environment-driven so deployments need no code changes).
+# ---------------------------------------------------------------------------
 
-# Set by the --parquet CLI flag (see __main__) or the env var directly. In
-# Parquet mode DuckDB queries the file from disk via a view instead of loading
-# the whole CSV into RAM — that's the memory/startup win.
-USE_PARQUET = os.getenv("DATAPULSE_USE_PARQUET") == "1"
+# Source CSV used by the "Try with sample data" button. The Dockerfile builds a
+# 100k-row file here; locally it defaults to the dev dataset.
+SAMPLE_FILE_PATH = os.getenv("DATAPULSE_DATA_FILE", "./data_10m.csv")
 
-# CORS allowed origins come from the environment (comma-separated) so the
-# deployed frontend's URL can be whitelisted without code changes. Defaults to
-# the local Vite/React dev servers.
+# CORS allowed origins (comma-separated). Defaults to the local dev servers; in
+# production set DATAPULSE_CORS_ORIGINS to the deployed frontend's URL.
 _DEFAULT_CORS_ORIGINS = "http://localhost:5173,http://localhost:3000"
 CORS_ALLOW_ORIGINS = [
-    origin.strip()
-    for origin in os.getenv("DATAPULSE_CORS_ORIGINS", _DEFAULT_CORS_ORIGINS).split(",")
-    if origin.strip()
+    o.strip()
+    for o in os.getenv("DATAPULSE_CORS_ORIGINS", _DEFAULT_CORS_ORIGINS).split(",")
+    if o.strip()
 ]
 
-# Columns that are safe to reference in SQL identifiers (sort_by, etc.).
-# Anything outside this allow-list is rejected, which is what protects the
-# dynamically-built parts of queries from SQL injection.
-SORTABLE_COLUMNS = {"id", "timestamp", "value", "category", "region"}
-TIME_INTERVALS = {"hour", "day", "week", "month", "year"}
+# Free-tier guard rails.
+MAX_UPLOAD_BYTES = int(os.getenv("DATAPULSE_MAX_UPLOAD_MB", "25")) * 1024 * 1024
+MAX_DATASETS = int(os.getenv("DATAPULSE_MAX_DATASETS", "8"))      # LRU cap
+DATASET_TTL_SECONDS = int(os.getenv("DATAPULSE_DATASET_TTL", "1800"))  # 30 min
+# The sample is capped so it loads instantly and stays light regardless of how
+# big the source file is.
+SAMPLE_ROW_CAP = int(os.getenv("DATAPULSE_SAMPLE_ROWS", "50000"))
 
-# Approximate seconds per bucket, finest -> coarsest. Used to cap how many
-# points a value_over_time chart can produce: an hour granularity over a 5-year
-# range is ~44k near-flat buckets — meaningless to read and heavy to render. We
-# reject any interval that would exceed MAX_CHART_BUCKETS for the selected range
-# and suggest the finest one that fits. (month/year are nominal averages, which
-# is plenty precise for a guard.)
+# Display/serving caps.
+MAX_CHART_BUCKETS = 2_000      # time-series granularity guard
+CATEGORY_TOP_N = 50            # category_counts slices
+HISTOGRAM_BINS = 30            # numeric_histogram bins
+EXPORT_BATCH = 50_000          # rows pulled per batch while streaming export
+
+# Filter operators allowed per classified column type.
+_OPS_BY_TYPE = {
+    "number": {"eq", "neq", "gte", "lte"},
+    "date": {"gte", "lte"},
+    "text": {"eq", "neq", "contains"},
+}
+_SQL_OP = {"eq": "=", "neq": "!=", "gte": ">=", "lte": "<="}
+
+# Approximate seconds per time-series bucket, finest -> coarsest.
 INTERVAL_SECONDS = {
     "hour": 3_600,
     "day": 86_400,
     "week": 604_800,
-    "month": 2_592_000,    # ~30 days
-    "year": 31_536_000,    # 365 days
+    "month": 2_592_000,
+    "year": 31_536_000,
 }
 INTERVAL_ORDER = ["hour", "day", "week", "month", "year"]
-MAX_CHART_BUCKETS = 2_000
 
-# Shared module-level state, populated at startup.
+
+# ---------------------------------------------------------------------------
+# Dataset registry (in-memory, thread-safe, evicting).
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Dataset:
+    id: str
+    table: str
+    columns: list[dict[str, str]]   # [{name, type, sql_type}]
+    row_count: int
+    source: str                     # "upload" | "sample"
+    name: str
+    created_at: float = field(default_factory=time.time)
+    last_access: float = field(default_factory=time.time)
+
+    @property
+    def column_names(self) -> list[str]:
+        return [c["name"] for c in self.columns]
+
+    def type_of(self, name: str) -> Optional[str]:
+        for c in self.columns:
+            if c["name"] == name:
+                return c["type"]
+        return None
+
+    def public(self) -> dict[str, Any]:
+        """Shape returned to the client (no internal table name leaked)."""
+        return {
+            "dataset_id": self.id,
+            "name": self.name,
+            "source": self.source,
+            "row_count": self.row_count,
+            "columns": self.columns,
+        }
+
+
 con: Optional[duckdb.DuckDBPyConnection] = None
-data_loaded: bool = False
-
-
-# The CSV is read with this exact expression in both modes, so the column
-# order and types (notably timestamp -> TIMESTAMP) are identical whether the
-# data is materialised in RAM (CSV mode) or written to Parquet. Keeping it in
-# one place is what guarantees byte-for-byte identical query results.
-_READ_CSV = (
-    f"SELECT id, CAST(timestamp AS TIMESTAMP) AS timestamp, value, category, region "
-    f"FROM read_csv_auto(?, header=true, timestampformat='%Y-%m-%d %H:%M:%S')"
-)
-
-
-def _load_csv_mode(connection: duckdb.DuckDBPyConnection) -> bool:
-    """Load the CSV into an in-memory table (default mode)."""
-    if not os.path.exists(DATA_FILE_PATH):
-        print(f"[startup] ERROR: data file not found at {DATA_FILE_PATH!r}. "
-              f"Run `python generate_data.py` first.")
-        return False
-
-    print(f"[startup] CSV mode: loading {DATA_FILE_PATH!r} into in-memory table "
-          f"{TABLE_NAME!r} ...")
-    connection.execute(
-        f"CREATE OR REPLACE TABLE {TABLE_NAME} AS {_READ_CSV}",
-        [DATA_FILE_PATH],
-    )
-    rows = connection.execute(f"SELECT COUNT(*) FROM {TABLE_NAME}").fetchone()[0]
-    print(f"[startup] Loaded {rows:,} rows into RAM.")
-    return True
-
-
-def _load_parquet_mode(connection: duckdb.DuckDBPyConnection) -> bool:
-    """Query a Parquet file directly from disk via a view (low-memory mode).
-
-    Converts the CSV to Parquet once (skipped if the file already exists), then
-    exposes it as a view named ``data`` so every endpoint's SQL is unchanged.
-    Unlike CSV mode the rows are not held in RAM — DuckDB streams them from the
-    Parquet file per query.
-    """
-    if not os.path.exists(PARQUET_FILE_PATH):
-        if not os.path.exists(DATA_FILE_PATH):
-            print(f"[startup] ERROR: neither {PARQUET_FILE_PATH!r} nor "
-                  f"{DATA_FILE_PATH!r} found. Run `python generate_data.py` first.")
-            return False
-        print(f"[startup] Parquet mode: converting {DATA_FILE_PATH!r} -> "
-              f"{PARQUET_FILE_PATH!r} (one-time) ...")
-        # COPY straight from the CSV read expression; the source rows are
-        # streamed through, not materialised into a table.
-        connection.execute(
-            f"COPY ({_READ_CSV}) TO '{PARQUET_FILE_PATH}' (FORMAT PARQUET)",
-            [DATA_FILE_PATH],
-        )
-        print(f"[startup] Conversion done.")
-    else:
-        print(f"[startup] Parquet mode: using existing {PARQUET_FILE_PATH!r}.")
-
-    # A view keeps reads on disk (no full load into RAM).
-    connection.execute(
-        f"CREATE OR REPLACE VIEW {TABLE_NAME} AS "
-        f"SELECT * FROM read_parquet('{PARQUET_FILE_PATH}')"
-    )
-    rows = connection.execute(f"SELECT COUNT(*) FROM {TABLE_NAME}").fetchone()[0]
-    print(f"[startup] Querying {rows:,} rows from disk (Parquet).")
-    return True
-
-
-def _load_data(connection: duckdb.DuckDBPyConnection) -> bool:
-    """Dispatch to CSV or Parquet startup based on the configured mode."""
-    return _load_parquet_mode(connection) if USE_PARQUET else _load_csv_mode(connection)
+_registry: dict[str, Dataset] = {}
+_lock = threading.Lock()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup/shutdown lifecycle (replaces deprecated on_event handlers)."""
-    global con, data_loaded
+    global con
     con = duckdb.connect(database=":memory:")
-    data_loaded = _load_data(con)
-    if data_loaded:
-        print("[startup] DataPulse API ready.")
+    print(f"[startup] DataPulse ready. Sample source: {SAMPLE_FILE_PATH!r}. "
+          f"Limits: {MAX_UPLOAD_BYTES // (1024*1024)}MB/file, "
+          f"{MAX_DATASETS} datasets, {DATASET_TTL_SECONDS}s TTL.")
     yield
     if con is not None:
         con.close()
         print("[shutdown] DuckDB connection closed.")
 
 
-app = FastAPI(title="DataPulse API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="DataPulse API", version="2.0.0", lifespan=lifespan)
 
-# Allow the configured frontends (dev servers by default; the deployed origin
-# in production) to call the API. See CORS_ALLOW_ORIGINS / DATAPULSE_CORS_ORIGINS.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ALLOW_ORIGINS,
@@ -171,188 +145,358 @@ app.add_middleware(
 )
 
 
-def _cursor() -> duckdb.DuckDBPyConnection:
-    """Return a per-request DuckDB cursor.
+# ---------------------------------------------------------------------------
+# Helpers.
+# ---------------------------------------------------------------------------
 
-    FastAPI runs sync endpoints across a threadpool, so multiple requests can
-    execute simultaneously. A single shared DuckDB connection is NOT safe for
-    concurrent queries — overlapping calls clobber each other's result set
-    (manifesting as ``fetchone() -> None`` / "too many values to unpack" /
-    500s). ``con.cursor()`` hands back a lightweight, independent handle to the
-    same in-memory database that is safe to use on its own thread.
+def _qi(identifier: str) -> str:
+    """Quote a SQL identifier (table/column), escaping embedded quotes.
+
+    Column names come from user CSVs, so every identifier interpolated into SQL
+    goes through here. Combined with validating column names against the
+    dataset's known set, this is what keeps the dynamic SQL non-injectable.
     """
-    if not data_loaded or con is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Data file {DATA_FILE_PATH!r} not found or failed to load. "
-                   f"Run `python generate_data.py` and restart the server.",
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _classify(sql_type: str) -> str:
+    """Map a DuckDB SQL type to one of: number | date | text."""
+    t = sql_type.upper()
+    if any(k in t for k in ("INT", "DECIMAL", "DOUBLE", "FLOAT", "REAL", "NUMERIC", "HUGEINT")):
+        return "number"
+    if any(k in t for k in ("TIMESTAMP", "DATE", "TIME")):
+        return "date"
+    return "text"
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    return value
+
+
+def _fmt_num(x: float) -> str:
+    """Human-readable number for chart labels (no scientific notation)."""
+    if x == int(x):
+        return f"{int(x):,}"
+    return f"{x:,.2f}".rstrip("0").rstrip(".")
+
+
+def _evict_locked() -> None:
+    """Drop stale and excess datasets. Caller must hold _lock."""
+    assert con is not None
+    now = time.time()
+    expired = [k for k, d in _registry.items() if now - d.last_access > DATASET_TTL_SECONDS]
+    for k in expired:
+        con.execute(f"DROP TABLE IF EXISTS {_qi(_registry[k].table)}")
+        del _registry[k]
+    # LRU: drop the least-recently-accessed until under the cap.
+    while len(_registry) > MAX_DATASETS:
+        oldest = min(_registry, key=lambda k: _registry[k].last_access)
+        con.execute(f"DROP TABLE IF EXISTS {_qi(_registry[oldest].table)}")
+        del _registry[oldest]
+
+
+def _get_dataset(dataset_id: str) -> Dataset:
+    """Fetch a dataset by id, bumping its access time; 404 if missing/expired."""
+    with _lock:
+        ds = _registry.get(dataset_id)
+        if ds is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Dataset not found. It may have expired — please upload your "
+                       "CSV again or load the sample data.",
+            )
+        if time.time() - ds.last_access > DATASET_TTL_SECONDS:
+            assert con is not None
+            con.execute(f"DROP TABLE IF EXISTS {_qi(ds.table)}")
+            del _registry[dataset_id]
+            raise HTTPException(
+                status_code=404,
+                detail="Dataset expired. Please upload your CSV again or load the "
+                       "sample data.",
+            )
+        ds.last_access = time.time()
+        return ds
+
+
+def _create_dataset(path: str, name: str, source: str, row_cap: Optional[int] = None) -> Dataset:
+    """Load a CSV file at ``path`` into a fresh isolated table and register it.
+
+    Raises HTTPException(400) with a friendly message on anything DuckDB can't
+    parse (non-CSV, malformed, no header, empty). Caller is responsible for the
+    file's lifetime — the data lives in the table afterwards, not on disk.
+    """
+    assert con is not None
+    dataset_id = uuid.uuid4().hex
+    table = f"ds_{dataset_id}"  # hex-only -> always a safe identifier
+    limit = f" LIMIT {int(row_cap)}" if row_cap else ""
+
+    with _lock:
+        try:
+            # Tolerant read: skip bad lines and pad ragged rows rather than
+            # crashing, but still surface a clean error if nothing usable comes
+            # out. sample_size=-1 scans the whole (<=25MB) file for type detection.
+            con.execute(
+                f"CREATE TABLE {_qi(table)} AS "
+                f"SELECT * FROM read_csv_auto(?, header=true, ignore_errors=true, "
+                f"null_padding=true, sample_size=-1){limit}",
+                [path],
+            )
+        except Exception as exc:  # noqa: BLE001 - any parse failure -> friendly 400
+            con.execute(f"DROP TABLE IF EXISTS {_qi(table)}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not read this file as CSV. {str(exc).splitlines()[0]}",
+            ) from exc
+
+        info = con.execute(f"PRAGMA table_info({_qi(table)})").fetchall()
+        # PRAGMA table_info -> (cid, name, type, notnull, dflt_value, pk)
+        columns = [
+            {"name": r[1], "type": _classify(r[2]), "sql_type": r[2]}
+            for r in info
+        ]
+        row_count = con.execute(f"SELECT COUNT(*) FROM {_qi(table)}").fetchone()[0]
+
+        # Validation that needs the parsed shape.
+        problem: Optional[str] = None
+        if not columns:
+            problem = "No columns were detected in the file."
+        elif row_count == 0:
+            problem = "The file has no data rows. Make sure the first row is a header and there is at least one data row below it."
+        elif all(c["name"].startswith("column") and c["name"][6:].isdigit() for c in columns):
+            problem = "No header row was detected. Please include column names in the first row of the CSV."
+        if problem:
+            con.execute(f"DROP TABLE IF EXISTS {_qi(table)}")
+            raise HTTPException(status_code=400, detail=problem)
+
+        ds = Dataset(
+            id=dataset_id, table=table, columns=columns,
+            row_count=int(row_count), source=source, name=name,
         )
+        _registry[dataset_id] = ds
+        _evict_locked()
+        return ds
+
+
+def _cursor() -> duckdb.DuckDBPyConnection:
+    """A per-request DuckDB cursor (safe for concurrent queries across threads)."""
+    if con is None:
+        raise HTTPException(status_code=503, detail="Server not ready.")
     return con.cursor()
 
 
-def _build_filters(
-    category: Optional[str],
-    min_value: Optional[float],
-    max_value: Optional[float],
-    start_date: Optional[str],
-    end_date: Optional[str],
-) -> tuple[str, list[Any]]:
-    """Build a parameterised WHERE clause shared by query/chart endpoints."""
+def _build_where(ds: Dataset, filters_json: Optional[str]) -> tuple[str, list[Any]]:
+    """Translate the JSON ``filters`` param into a parameterised WHERE clause.
+
+    ``filters`` is a JSON array of {col, op, value}. Columns are validated
+    against the dataset's schema and operators against an allow-list per column
+    type; values are always bound, so the result is not injectable.
+    """
+    if not filters_json:
+        return "", []
+    try:
+        items = json.loads(filters_json)
+        assert isinstance(items, list)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="Invalid filters parameter.") from exc
+
     clauses: list[str] = []
     params: list[Any] = []
-
-    if category is not None:
-        clauses.append("category = ?")
-        params.append(category)
-    if min_value is not None:
-        clauses.append("value >= ?")
-        params.append(min_value)
-    if max_value is not None:
-        clauses.append("value <= ?")
-        params.append(max_value)
-    if start_date is not None:
-        clauses.append("timestamp >= ?")
-        params.append(start_date)
-    if end_date is not None:
-        clauses.append("timestamp <= ?")
-        params.append(end_date)
+    for item in items:
+        col = item.get("col")
+        op = item.get("op")
+        value = item.get("value")
+        if col is None or value is None or value == "":
+            continue
+        col_type = ds.type_of(col)
+        if col_type is None:
+            raise HTTPException(status_code=400, detail=f"Unknown column {col!r}.")
+        if op not in _OPS_BY_TYPE[col_type]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Operator {op!r} is not valid for {col_type} column {col!r}.",
+            )
+        ident = _qi(col)
+        if op == "contains":
+            clauses.append(f"CAST({ident} AS VARCHAR) ILIKE ?")
+            params.append(f"%{value}%")
+        else:
+            sql_op = _SQL_OP[op]
+            if col_type == "number":
+                clauses.append(f"{ident} {sql_op} CAST(? AS DOUBLE)")
+            elif col_type == "date":
+                clauses.append(f"{ident} {sql_op} CAST(? AS TIMESTAMP)")
+            else:
+                clauses.append(f"{ident} {sql_op} ?")
+            params.append(value)
 
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     return where, params
 
 
-def _order_clause(sort_by: Optional[str], sort_order: str) -> str:
-    """Validate sort params and return an ORDER BY clause (or empty string).
-
-    sort_by is checked against the column allow-list and sort_order against
-    asc/desc, so the result is safe to interpolate into SQL. Shared by the
-    query and export endpoints. Raises HTTPException(400) on invalid input.
-
-    Always ends with ``id`` as a tiebreaker (id is unique) so the ordering is a
-    *total* order. Without it, sorting on a low-cardinality column like `value`
-    (~10k distinct values over 10M rows) leaves tied rows in storage-dependent
-    order, which makes pagination unstable and makes CSV- vs Parquet-mode
-    results differ. With it, results are deterministic and identical.
-    """
-    if sort_by is not None and sort_by not in SORTABLE_COLUMNS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid sort_by {sort_by!r}. Allowed: {sorted(SORTABLE_COLUMNS)}",
-        )
+def _order_clause(ds: Dataset, sort_by: Optional[str], sort_order: str) -> str:
+    """Validated ORDER BY. Uses DuckDB's rowid as a stable tiebreaker so
+    pagination is deterministic even when sorting a low-cardinality column."""
     if sort_order.lower() not in {"asc", "desc"}:
         raise HTTPException(status_code=400, detail="sort_order must be 'asc' or 'desc'.")
-    if sort_by is None or sort_by == "id":
-        return f" ORDER BY id {sort_order.upper() if sort_by == 'id' else 'ASC'}"
-    return f" ORDER BY {sort_by} {sort_order.upper()}, id ASC"
+    if sort_by is None or sort_by == "":
+        return " ORDER BY rowid"
+    if sort_by not in ds.column_names:
+        raise HTTPException(status_code=400, detail=f"Unknown sort column {sort_by!r}.")
+    return f" ORDER BY {_qi(sort_by)} {sort_order.upper()}, rowid"
 
+
+# ---------------------------------------------------------------------------
+# Endpoints.
+# ---------------------------------------------------------------------------
 
 @app.get("/")
-def root() -> dict[str, str]:
-    return {"message": "DataPulse API is running"}
+def root() -> dict[str, Any]:
+    return {"message": "DataPulse API is running", "active_datasets": len(_registry)}
 
 
-@app.get("/data/summary")
-def data_summary() -> dict[str, Any]:
-    """High-level statistics over the full dataset."""
+@app.post("/datasets")
+async def upload_dataset(file: UploadFile = File(...)) -> dict[str, Any]:
+    """Receive a CSV upload, load it into an isolated table, return id + schema."""
+    filename = file.filename or "upload.csv"
+    if not filename.lower().endswith((".csv", ".tsv", ".txt")):
+        raise HTTPException(
+            status_code=400,
+            detail="Please upload a .csv file.",
+        )
+
+    # Stream to a temp file, enforcing the size cap as we go (never trust the
+    # client's Content-Length). The temp file is deleted right after loading.
+    tmp = tempfile.NamedTemporaryFile(prefix="datapulse_", suffix=".csv", delete=False)
+    size = 0
+    try:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_UPLOAD_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File is too large. The limit is "
+                           f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
+                )
+            tmp.write(chunk)
+        tmp.close()
+
+        if size == 0:
+            raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+
+        ds = _create_dataset(tmp.name, name=filename, source="upload")
+        return ds.public()
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
+@app.post("/datasets/sample")
+def create_sample_dataset() -> dict[str, Any]:
+    """Load the bundled demo dataset so first-time visitors see it work instantly."""
+    if not os.path.exists(SAMPLE_FILE_PATH):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Sample data is unavailable on this server "
+                   f"({SAMPLE_FILE_PATH!r} not found).",
+        )
+    ds = _create_dataset(
+        SAMPLE_FILE_PATH, name="Sample data", source="sample", row_cap=SAMPLE_ROW_CAP
+    )
+    return ds.public()
+
+
+@app.get("/datasets/{dataset_id}/summary")
+def dataset_summary(dataset_id: str) -> dict[str, Any]:
+    """Row/column counts plus per-column basic stats (adapts to column types)."""
+    ds = _get_dataset(dataset_id)
     cur = _cursor()
 
-    total_rows, min_ts, max_ts, avg_value = cur.execute(
-        f"""
-        SELECT COUNT(*),
-               MIN(timestamp),
-               MAX(timestamp),
-               AVG(value)
-        FROM {TABLE_NAME}
-        """
+    # One scan computes every column's stats. Build the SELECT list and remember
+    # which result slot maps to which (column, stat).
+    select_parts: list[str] = ["COUNT(*)"]
+    plan: list[tuple[str, str]] = []  # (column_name, stat_key) aligned to slots after COUNT(*)
+    for c in ds.columns:
+        ident = _qi(c["name"])
+        if c["type"] == "number":
+            select_parts += [f"MIN({ident})", f"MAX({ident})", f"AVG({ident})"]
+            plan += [(c["name"], "min"), (c["name"], "max"), (c["name"], "avg")]
+        elif c["type"] == "date":
+            select_parts += [f"MIN({ident})", f"MAX({ident})"]
+            plan += [(c["name"], "min"), (c["name"], "max")]
+        else:
+            select_parts += [f"COUNT(DISTINCT {ident})"]
+            plan += [(c["name"], "distinct")]
+
+    row = cur.execute(
+        f"SELECT {', '.join(select_parts)} FROM {_qi(ds.table)}"
     ).fetchone()
 
-    # PRAGMA table_info columns: (cid, name, type, notnull, dflt_value, pk) ->
-    # the column name is at index 1.
-    columns = [row[1] for row in cur.execute(
-        f"PRAGMA table_info('{TABLE_NAME}')"
-    ).fetchall()]
-
-    unique_categories = [r[0] for r in cur.execute(
-        f"SELECT DISTINCT category FROM {TABLE_NAME} ORDER BY category"
-    ).fetchall()]
+    total_rows = int(row[0])
+    stats: dict[str, dict[str, Any]] = {c["name"]: {"type": c["type"]} for c in ds.columns}
+    for slot, (col, key) in enumerate(plan, start=1):
+        val = row[slot]
+        if key == "avg" and val is not None:
+            val = round(float(val), 4)
+        stats[col][key] = _jsonable(val)
 
     return {
-        "total_rows": int(total_rows),
-        "columns": columns,
-        "min_timestamp": min_ts.isoformat() if min_ts else None,
-        "max_timestamp": max_ts.isoformat() if max_ts else None,
-        "avg_value": round(float(avg_value), 4) if avg_value is not None else None,
-        "unique_categories": unique_categories,
+        "total_rows": total_rows,
+        "total_columns": len(ds.columns),
+        "columns": [{"name": c["name"], **stats[c["name"]]} for c in ds.columns],
     }
 
 
-@app.get("/data/query")
-def data_query(
+@app.get("/datasets/{dataset_id}/query")
+def dataset_query(
+    dataset_id: str,
     page: int = Query(1, ge=1),
-    page_size: int = Query(100, ge=1, le=1000),
+    page_size: int = Query(50, ge=1, le=1000),
     sort_by: Optional[str] = None,
     sort_order: str = Query("asc"),
-    category: Optional[str] = None,
-    min_value: Optional[float] = None,
-    max_value: Optional[float] = None,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
+    filters: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Paginated, sortable, filterable rows."""
+    """Paginated, sortable, filterable rows over the uploaded dataset."""
+    ds = _get_dataset(dataset_id)
     cur = _cursor()
-    order_clause = _order_clause(sort_by, sort_order)
 
-    where, params = _build_filters(
-        category, min_value, max_value, start_date, end_date
-    )
+    where, params = _build_where(ds, filters)
+    order = _order_clause(ds, sort_by, sort_order)
 
     total_count = cur.execute(
-        f"SELECT COUNT(*) FROM {TABLE_NAME}{where}", params
+        f"SELECT COUNT(*) FROM {_qi(ds.table)}{where}", params
     ).fetchone()[0]
 
     offset = (page - 1) * page_size
-    sql = (
-        f"SELECT * FROM {TABLE_NAME}{where}{order_clause} "
-        f"LIMIT ? OFFSET ?"
+    cur.execute(
+        f"SELECT * FROM {_qi(ds.table)}{where}{order} LIMIT ? OFFSET ?",
+        [*params, page_size, offset],
     )
-    cur.execute(sql, [*params, page_size, offset])
-    columns = [d[0] for d in cur.description]
-    rows = [dict(zip(columns, r)) for r in cur.fetchall()]
-
-    # Make timestamps JSON-serialisable.
-    for row in rows:
-        ts = row.get("timestamp")
-        if isinstance(ts, datetime):
-            row["timestamp"] = ts.isoformat()
+    cols = [d[0] for d in cur.description]
+    rows = [{k: _jsonable(v) for k, v in zip(cols, r)} for r in cur.fetchall()]
 
     return {
         "data": rows,
+        "columns": ds.columns,
         "total_count": int(total_count),
         "current_page": page,
         "page_size": page_size,
     }
 
 
-# Rows pulled from DuckDB per batch while streaming an export. Keeps the Python
-# side bounded regardless of how many rows the filtered set contains.
-EXPORT_BATCH = 50_000
-
-
 def _stream_csv(sql: str, params: list[Any]) -> Iterator[str]:
-    """Yield CSV text for ``sql`` in batches, never materialising it all.
-
-    Uses its own cursor (the request thread's cursor must not be shared with a
-    generator consumed during response streaming) and ``fetchmany`` so only
-    EXPORT_BATCH rows are held in memory at a time.
-    """
+    """Yield CSV text for ``sql`` in batches (own cursor, never fully buffered)."""
     cur = con.cursor()
     cur.execute(sql, params)
-
     header = io.StringIO()
-    writer = csv.writer(header)
-    writer.writerow([d[0] for d in cur.description])
+    csv.writer(header).writerow([d[0] for d in cur.description])
     yield header.getvalue()
-
     while True:
         batch = cur.fetchmany(EXPORT_BATCH)
         if not batch:
@@ -362,119 +506,133 @@ def _stream_csv(sql: str, params: list[Any]) -> Iterator[str]:
         yield chunk.getvalue()
 
 
-@app.get("/data/export")
-def data_export(
+@app.get("/datasets/{dataset_id}/export")
+def dataset_export(
+    dataset_id: str,
     sort_by: Optional[str] = None,
     sort_order: str = Query("asc"),
-    category: Optional[str] = None,
-    min_value: Optional[float] = None,
-    max_value: Optional[float] = None,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
+    filters: Optional[str] = None,
 ) -> StreamingResponse:
-    """Stream the full filtered + sorted result set as CSV.
-
-    Accepts the same filter/sort parameters as ``/data/query`` (minus
-    pagination) so the export matches exactly what the table is showing. The
-    response is streamed, so neither DuckDB nor FastAPI buffers the whole CSV.
-    """
-    # Validate up front so bad params return a clean 4xx (a generator can't set
-    # the status code once streaming has started). _cursor() also guards 404.
-    _cursor()
-    order_clause = _order_clause(sort_by, sort_order)
-    where, params = _build_filters(
-        category, min_value, max_value, start_date, end_date
-    )
-
-    sql = f"SELECT * FROM {TABLE_NAME}{where}{order_clause}"
+    """Stream the current filtered + sorted view as CSV."""
+    ds = _get_dataset(dataset_id)
+    where, params = _build_where(ds, filters)
+    order = _order_clause(ds, sort_by, sort_order)
+    sql = f"SELECT * FROM {_qi(ds.table)}{where}{order}"
     return StreamingResponse(
         _stream_csv(sql, params),
         media_type="text/csv",
-        headers={
-            "Content-Disposition": 'attachment; filename="datapulse_export.csv"'
-        },
+        headers={"Content-Disposition": 'attachment; filename="datapulse_export.csv"'},
     )
 
 
-@app.get("/data/chart")
-def data_chart(
-    chart_type: str = Query(..., description="value_over_time | category_distribution"),
-    interval: str = Query("day"),
-    category: Optional[str] = None,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
+def _pick_interval(span_seconds: float, requested: Optional[str]) -> str:
+    """Choose a time-series interval that stays under MAX_CHART_BUCKETS."""
+    def fits(iv: str) -> bool:
+        return span_seconds / INTERVAL_SECONDS[iv] <= MAX_CHART_BUCKETS
+    if requested and requested in INTERVAL_SECONDS and fits(requested):
+        return requested
+    return next((iv for iv in INTERVAL_ORDER if fits(iv)), "year")
+
+
+@app.get("/datasets/{dataset_id}/chart")
+def dataset_chart(
+    dataset_id: str,
+    chart_type: str = Query(..., description="category_counts | time_series | numeric_histogram"),
+    column: str = Query(..., description="Column to chart"),
+    y_column: Optional[str] = None,
+    agg: str = Query("count", description="count | avg | sum (time_series)"),
+    interval: Optional[str] = None,
+    filters: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Aggregated data shaped for charting."""
+    """Aggregated data shaped for charting; adapts to the chosen column's type."""
+    ds = _get_dataset(dataset_id)
     cur = _cursor()
+    if column not in ds.column_names:
+        raise HTTPException(status_code=400, detail=f"Unknown column {column!r}.")
+    where, params = _build_where(ds, filters)
+    col = _qi(column)
+    tbl = _qi(ds.table)
 
-    where, params = _build_filters(
-        category, None, None, start_date, end_date
-    )
+    if chart_type == "category_counts":
+        sql = (
+            f"SELECT CAST({col} AS VARCHAR) AS label, COUNT(*) AS count "
+            f"FROM {tbl}{where} GROUP BY label ORDER BY count DESC LIMIT {CATEGORY_TOP_N}"
+        )
+        data = [{"label": lbl, "count": int(cnt)} for lbl, cnt in cur.execute(sql, params).fetchall()]
+        return {"chart_type": chart_type, "column": column, "data": data}
 
-    if chart_type == "value_over_time":
-        if interval not in TIME_INTERVALS:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid interval {interval!r}. "
-                       f"Allowed: {sorted(TIME_INTERVALS)}",
-            )
-        # Cap granularity to the selected range. Measure the actual span of the
-        # (filtered) data and reject intervals that would over-produce buckets.
+    if chart_type == "time_series":
+        if ds.type_of(column) != "date":
+            raise HTTPException(status_code=400, detail=f"{column!r} is not a date column.")
+        if agg not in {"count", "avg", "sum"}:
+            raise HTTPException(status_code=400, detail="agg must be count, avg or sum.")
+        if agg in {"avg", "sum"}:
+            if not y_column or y_column not in ds.column_names:
+                raise HTTPException(status_code=400, detail="A numeric y_column is required for avg/sum.")
+            if ds.type_of(y_column) != "number":
+                raise HTTPException(status_code=400, detail=f"{y_column!r} is not a numeric column.")
+
         min_ts, max_ts = cur.execute(
-            f"SELECT MIN(timestamp), MAX(timestamp) FROM {TABLE_NAME}{where}",
-            params,
+            f"SELECT MIN({col}), MAX({col}) FROM {tbl}{where}", params
         ).fetchone()
-        if min_ts is not None and max_ts is not None:
-            span = (max_ts - min_ts).total_seconds()
-            est_buckets = span / INTERVAL_SECONDS[interval]
-            if est_buckets > MAX_CHART_BUCKETS:
-                suggested = next(
-                    (iv for iv in INTERVAL_ORDER
-                     if span / INTERVAL_SECONDS[iv] <= MAX_CHART_BUCKETS),
-                    "year",
-                )
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Interval {interval!r} would produce ~{int(est_buckets):,} "
-                        f"buckets over the selected range (max {MAX_CHART_BUCKETS}). "
-                        f"Use a coarser interval (e.g. {suggested!r}) or narrow the "
-                        f"date range."
-                    ),
-                )
+        if min_ts is None or max_ts is None:
+            return {"chart_type": chart_type, "column": column, "interval": interval, "data": []}
+        span = max((max_ts - min_ts).total_seconds(), 1.0)
+        chosen = _pick_interval(span, interval)
 
-        # interval is validated against the allow-list above.
+        if agg == "count":
+            agg_expr = "COUNT(*)"
+        else:
+            agg_expr = f"{agg.upper()}({_qi(y_column)})"
         sql = (
-            f"SELECT date_trunc('{interval}', timestamp) AS bucket, "
-            f"       AVG(value) AS avg_value "
-            f"FROM {TABLE_NAME}{where} "
-            f"GROUP BY bucket ORDER BY bucket"
+            f"SELECT date_trunc('{chosen}', {col}) AS bucket, {agg_expr} AS value "
+            f"FROM {tbl}{where} GROUP BY bucket ORDER BY bucket"
         )
-        result = [
-            {
-                "time": bucket.isoformat() if isinstance(bucket, datetime) else str(bucket),
-                "avg_value": round(float(avg), 4),
-            }
-            for bucket, avg in cur.execute(sql, params).fetchall()
+        data = [
+            {"time": _jsonable(bucket), "value": round(float(v), 4) if v is not None else None}
+            for bucket, v in cur.execute(sql, params).fetchall()
         ]
-        return {"chart_type": chart_type, "interval": interval, "data": result}
+        return {"chart_type": chart_type, "column": column, "interval": chosen,
+                "agg": agg, "y_column": y_column, "data": data}
 
-    if chart_type == "category_distribution":
+    if chart_type == "numeric_histogram":
+        if ds.type_of(column) != "number":
+            raise HTTPException(status_code=400, detail=f"{column!r} is not a numeric column.")
+        lo, hi, n = cur.execute(
+            f"SELECT MIN({col}), MAX({col}), COUNT({col}) FROM {tbl}{where}", params
+        ).fetchone()
+        if n == 0 or lo is None:
+            return {"chart_type": chart_type, "column": column, "data": []}
+        lo, hi = float(lo), float(hi)
+        if hi <= lo:
+            return {"chart_type": chart_type, "column": column,
+                    "data": [{"label": _fmt_num(lo), "bin_start": lo, "bin_end": lo, "count": int(n)}]}
+        bins = HISTOGRAM_BINS
+        width = (hi - lo) / bins
+        # Bucket each value; clamp the max into the last bin. lo/hi/width are
+        # server-computed floats, safe to inline.
         sql = (
-            f"SELECT category, COUNT(*) AS count "
-            f"FROM {TABLE_NAME}{where} "
-            f"GROUP BY category ORDER BY count DESC"
+            f"SELECT LEAST({bins - 1}, CAST(FLOOR(({col} - {lo}) / {width}) AS INTEGER)) AS b, "
+            f"COUNT(*) AS count FROM {tbl}{where} WHERE {col} IS NOT NULL "
+            f"GROUP BY b ORDER BY b"
         )
-        result = [
-            {"category": cat, "count": int(count)}
-            for cat, count in cur.execute(sql, params).fetchall()
-        ]
-        return {"chart_type": chart_type, "data": result}
+        counts = {int(b): int(c) for b, c in cur.execute(sql, params).fetchall()}
+        data = []
+        for b in range(bins):
+            start = lo + b * width
+            end = start + width
+            data.append({
+                "label": f"{_fmt_num(start)}–{_fmt_num(end)}",
+                "bin_start": round(start, 6),
+                "bin_end": round(end, 6),
+                "count": counts.get(b, 0),
+            })
+        return {"chart_type": chart_type, "column": column, "data": data}
 
     raise HTTPException(
         status_code=400,
-        detail=f"Invalid chart_type {chart_type!r}. "
-               f"Allowed: ['value_over_time', 'category_distribution']",
+        detail=f"Invalid chart_type {chart_type!r}. Allowed: "
+               f"category_counts, time_series, numeric_histogram.",
     )
 
 
@@ -484,20 +642,7 @@ if __name__ == "__main__":
     import uvicorn
 
     parser = argparse.ArgumentParser(description="Run the DataPulse API.")
-    parser.add_argument(
-        "--parquet",
-        action="store_true",
-        help="Convert the CSV to Parquet once and query it from disk "
-             "(lower memory, faster cold start) instead of loading into RAM.",
-    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
-
-    # The lifespan reads this at startup; setting it here keeps `uvicorn
-    # main:app` working too (export DATAPULSE_USE_PARQUET=1).
-    if args.parquet:
-        os.environ["DATAPULSE_USE_PARQUET"] = "1"
-        USE_PARQUET = True
-
     uvicorn.run(app, host=args.host, port=args.port)
