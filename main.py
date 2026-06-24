@@ -30,6 +30,7 @@ import duckdb
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 # ---------------------------------------------------------------------------
 # Configuration (environment-driven so deployments need no code changes).
@@ -389,6 +390,41 @@ async def upload_dataset(file: UploadFile = File(...)) -> dict[str, Any]:
             raise HTTPException(status_code=400, detail="The uploaded file is empty.")
 
         ds = _create_dataset(tmp.name, name=filename, source="upload")
+        return ds.public()
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
+class PasteRequest(BaseModel):
+    text: str
+    name: Optional[str] = None
+
+
+@app.post("/datasets/text")
+def upload_text(req: PasteRequest) -> dict[str, Any]:
+    """Load pasted CSV / tab-separated text, exactly like an uploaded file.
+
+    DuckDB's CSV reader auto-detects the delimiter, so spreadsheet copy-paste
+    (tab-separated) and comma-separated text both work. Same size limit and
+    validation as the file upload path.
+    """
+    if not req.text.strip():
+        raise HTTPException(status_code=400, detail="No text was provided to analyze.")
+    data = req.text.encode("utf-8")
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Pasted text is too large. The limit is "
+                   f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
+        )
+    tmp = tempfile.NamedTemporaryFile(prefix="datapulse_", suffix=".csv", delete=False)
+    try:
+        tmp.write(data)
+        tmp.close()
+        ds = _create_dataset(tmp.name, name=(req.name or "Pasted data"), source="paste")
         return ds.public()
     finally:
         try:
