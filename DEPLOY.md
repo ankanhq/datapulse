@@ -1,64 +1,50 @@
 # Deploying DataPulse
 
-This guide deploys the **backend** (FastAPI + DuckDB) to [Render](https://render.com)
-as a Docker web service, and the **frontend** (React + Vite) to
-[Vercel](https://vercel.com).
-
-The two are wired together by two environment variables:
+DataPulse runs as two pieces: the **backend** (FastAPI + DuckDB) on
+[Render](https://render.com) as a Docker service, and the **frontend** (React +
+Vite) on [Vercel](https://vercel.com). They're wired together by two environment
+variables:
 
 | Where    | Variable                 | Points at        |
 |----------|--------------------------|------------------|
 | Backend  | `DATAPULSE_CORS_ORIGINS` | the Vercel URL   |
 | Frontend | `VITE_API_BASE`          | the Render URL   |
 
-Because each side needs the other's URL, deploy in this order: **backend first**,
-then frontend, then come back and set the backend's `DATAPULSE_CORS_ORIGINS` to
-the real Vercel URL.
-
-Assumed layout: backend in a repo containing `datapulse/`, frontend in a repo
-containing `datapulse-frontend/` (they can be the same repo or two repos).
+Because each side needs the other's URL, deploy the **backend first**, then the
+frontend, then come back and set the backend's `DATAPULSE_CORS_ORIGINS` to the
+real Vercel URL.
 
 ---
 
 ## Part 1 — Backend on Render (Docker)
 
-The `Dockerfile` is self-contained: it generates the smaller **100,000-row**
-production dataset at build time (`python generate_data.py --rows 100000 --out
-data_100k.csv`) and points the API at it via `DATAPULSE_DATA_FILE`. You do **not**
-need to commit any data file.
+The `Dockerfile` is self-contained: it generates a 100,000-row sample dataset at
+build time and points the sample endpoint at it via `DATAPULSE_DATA_FILE`. No
+data file needs to be committed — uploads and pastes don't need one at all.
 
-1. Push the backend (`datapulse/` with `Dockerfile`, `render.yaml`, `main.py`,
-   `generate_data.py`, `requirements.txt`) to GitHub.
+A `render.yaml` blueprint is included, so the fastest path is:
 
-> **Fastest path — Blueprint:** a `render.yaml` is included. In Render choose
-> **New → Blueprint**, connect the repo, and Render reads `render.yaml` to create
-> the Docker service automatically. It will prompt you for `DATAPULSE_CORS_ORIGINS`
-> (set it to your Vercel URL — you can use a placeholder now and update it in
-> Part 3). Then skip to step 6 to verify. The manual steps below are the
-> alternative if you'd rather click through the dashboard.
+1. Push this repo to GitHub.
+2. In Render: **New → Blueprint**, connect the repo. Render reads `render.yaml`
+   and creates the Docker web service, prompting you for `DATAPULSE_CORS_ORIGINS`
+   (use a placeholder now, e.g. `https://placeholder.vercel.app`, and update it
+   in Part 3).
+3. Wait for the build to finish and the service to go **Live**.
 
-2. In the Render dashboard: **New** → **Web Service** → connect the repo.
-3. Configure the service:
-   - **Runtime:** `Docker` (Render auto-detects the `Dockerfile`).
-   - **Root Directory:** `datapulse` (only if the Dockerfile is in a subfolder;
-     leave blank if it's at the repo root).
-   - **Instance Type:** Free is fine — the 100k dataset uses well under 512 MB.
-   - Render injects `$PORT`; the container already binds to `0.0.0.0:$PORT`, so
-     no start command override is needed.
-4. Add environment variables (**Environment** tab):
+Prefer to click through manually instead? **New → Web Service**, connect the repo
+(Render auto-detects the `Dockerfile`), pick the Free instance, and add the env
+var below. The container binds to `0.0.0.0:$PORT`, which Render injects — no start
+command needed.
 
-   | Key                      | Value                                                | Notes |
-   |--------------------------|------------------------------------------------------|-------|
-   | `DATAPULSE_CORS_ORIGINS` | `https://YOUR-APP.vercel.app`                         | Comma-separate multiple origins. You'll get the real URL after Part 2 — set a placeholder now and update it. |
-   | `DATAPULSE_USE_PARQUET`  | `1`                                                  | *(optional)* query from disk instead of RAM for lower memory. |
-   | `DATAPULSE_DATA_FILE`    | `./data_100k.csv`                                    | *(optional)* already set in the Dockerfile; override only to change datasets. |
+| Key                      | Value                          | Notes |
+|--------------------------|--------------------------------|-------|
+| `DATAPULSE_CORS_ORIGINS` | `https://YOUR-APP.vercel.app`  | The frontend origin. Comma-separate multiple. Update after Part 2. |
 
-5. **Create Web Service** and wait for the build/deploy to finish.
-6. Verify: open `https://YOUR-API.onrender.com/data/summary` — you should see
-   `"total_rows":100000`.
+Verify: open `https://YOUR-API.onrender.com/` — you should see
+`{"message":"DataPulse API is running","active_datasets":0}`.
 
-> Note: Render free services spin down when idle, so the first request after a
-> while takes ~30–60 s to cold-start.
+> Free Render services spin down when idle, so the first request after a while
+> takes ~30–60 s to cold-start.
 
 Record the backend URL, e.g. `https://datapulse-api.onrender.com`.
 
@@ -66,25 +52,19 @@ Record the backend URL, e.g. `https://datapulse-api.onrender.com`.
 
 ## Part 2 — Frontend on Vercel
 
-The frontend reads its API base URL from `VITE_API_BASE` at **build time**
-(`src/api.js`), defaulting to `http://localhost:8000` when unset.
+The frontend reads its API base URL from `VITE_API_BASE` at **build time**.
 
-1. Push the frontend (`datapulse-frontend/`) to GitHub.
-2. In the Vercel dashboard: **Add New** → **Project** → import the repo.
-3. Configure the project:
-   - **Framework Preset:** `Vite` (auto-detected).
-   - **Root Directory:** `datapulse-frontend` (only if it's in a subfolder).
-   - **Build Command:** `npm run build` (default).
-   - **Output Directory:** `dist` (default).
-4. Add an environment variable (**Settings → Environment Variables**, scope to
-   **Production**):
+1. Push the frontend repo to GitHub.
+2. In Vercel: **Add New → Project**, import the repo. The **Vite** preset is
+   auto-detected (build `npm run build`, output `dist`).
+3. Add an environment variable (scope to **Production**):
 
-   | Key             | Value                                   |
-   |-----------------|-----------------------------------------|
-   | `VITE_API_BASE` | `https://datapulse-api.onrender.com`    |
+   | Key             | Value                                |
+   |-----------------|--------------------------------------|
+   | `VITE_API_BASE` | `https://datapulse-api.onrender.com` |
 
-   Use your real Render URL from Part 1, with **no trailing slash**.
-5. **Deploy.** Vercel builds and serves the static `dist/` output.
+   Use your real Render URL from Part 1, **no trailing slash**.
+4. **Deploy.**
 
 Record the frontend URL, e.g. `https://datapulse-frontend.vercel.app`.
 
@@ -92,26 +72,24 @@ Record the frontend URL, e.g. `https://datapulse-frontend.vercel.app`.
 
 ## Part 3 — Connect them (CORS)
 
-1. Back in **Render → your service → Environment**, set
-   `DATAPULSE_CORS_ORIGINS` to the exact Vercel URL from Part 2 (e.g.
-   `https://datapulse-frontend.vercel.app`, no trailing slash). Comma-separate
-   if you also want preview/custom domains.
-2. Save — Render redeploys automatically.
-3. Open the Vercel URL in a browser. The dashboard should load summary stats,
-   the table, and charts with **no CORS errors** in the dev console.
+1. In **Render → your service → Environment**, set `DATAPULSE_CORS_ORIGINS` to
+   the exact Vercel URL from Part 2 (no trailing slash). Save — Render redeploys.
+2. Open the Vercel URL, upload a CSV, and confirm it loads with no CORS errors.
 
-> If you change `VITE_API_BASE` later, you must **redeploy the frontend** —
-> Vite bakes it into the bundle at build time; it is not read at runtime.
+> Changing `VITE_API_BASE` later requires a **frontend redeploy** — Vite bakes it
+> into the bundle at build time; it is not read at runtime.
 
 ---
 
-## Quick reference — environment variables
+## Environment variables
 
 **Backend (Render):**
 - `DATAPULSE_CORS_ORIGINS` — comma-separated allowed frontend origins **(required in prod)**
-- `DATAPULSE_DATA_FILE` — path to the dataset (default `./data_100k.csv` in the image)
-- `DATAPULSE_PARQUET_FILE` — Parquet path (defaults to the data file with a `.parquet` extension)
-- `DATAPULSE_USE_PARQUET` — `1` to query Parquet from disk (lower memory)
+- `DATAPULSE_DATA_FILE` — source file for the sample endpoint (default `./data_100k.csv` in the image)
+- `DATAPULSE_MAX_UPLOAD_MB` — per-upload size limit, MB (default 25)
+- `DATAPULSE_MAX_DATASETS` — max in-memory datasets before LRU eviction (default 8)
+- `DATAPULSE_DATASET_TTL` — seconds before an idle dataset is evicted (default 1800)
+- `DATAPULSE_SAMPLE_ROWS` — row cap for the sample (default 50000)
 - `PORT` — injected by Render; the container binds to it automatically
 
 **Frontend (Vercel):**
@@ -119,23 +97,15 @@ Record the frontend URL, e.g. `https://datapulse-frontend.vercel.app`.
 
 ---
 
-## Local sanity check before deploying
-
-Build the production image and run it exactly as Render will:
+## Local check before deploying
 
 ```bash
+# Backend, exactly as Render runs it
 cd datapulse
 docker build -t datapulse-api .
-docker run --rm -p 8000:8000 \
-  -e DATAPULSE_CORS_ORIGINS="http://localhost:5173" \
-  datapulse-api
-curl localhost:8000/data/summary    # -> "total_rows":100000
-```
+docker run --rm -p 8000:8000 -e DATAPULSE_CORS_ORIGINS="http://localhost:5173" datapulse-api
 
-Build the frontend against that backend:
-
-```bash
-cd datapulse-frontend
-VITE_API_BASE=http://localhost:8000 npm run build
-npm run preview                     # serves dist/ at http://localhost:4173
+# Frontend against that backend
+cd ../datapulse-frontend
+VITE_API_BASE=http://localhost:8000 npm run build && npm run preview
 ```
