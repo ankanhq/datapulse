@@ -709,6 +709,103 @@ def dataset_chart(
     )
 
 
+def _compare_metric_expr(ds: Dataset, agg: str, metric_column: Optional[str]) -> str:
+    """Validated aggregate expression used by Compare Mode."""
+    if agg == "count":
+        return "COUNT(*)"
+    if agg not in {"sum", "avg"}:
+        raise HTTPException(status_code=400, detail="agg must be count, sum or avg.")
+    if not metric_column or metric_column not in ds.column_names:
+        raise HTTPException(status_code=400, detail="A numeric metric_column is required for sum/avg.")
+    if ds.type_of(metric_column) != "number":
+        raise HTTPException(status_code=400, detail=f"{metric_column!r} is not a numeric column.")
+    return f"{agg.upper()}({_qi(metric_column)})"
+
+
+def _metric_value(value: Any, agg: str) -> float | int:
+    if value is None:
+        return 0
+    if agg == "count":
+        return int(value)
+    return round(float(value), 4)
+
+
+@app.get("/datasets/{dataset_id}/compare")
+def dataset_compare(
+    dataset_id: str,
+    agg: str = Query("count", description="count | sum | avg"),
+    metric_column: Optional[str] = None,
+    date_column: Optional[str] = None,
+    dimension_column: Optional[str] = None,
+    interval: Optional[str] = None,
+    filters: Optional[str] = None,
+) -> dict[str, Any]:
+    """Compact aggregate snapshot for Compare Mode.
+
+    The frontend calls this twice (baseline/current) and computes deltas locally.
+    Keeping the heavy aggregation in DuckDB avoids shipping large row payloads to
+    the browser while preserving the existing upload/table/chart endpoints.
+    """
+    ds = _get_dataset(dataset_id)
+    cur = _cursor()
+    metric_expr = _compare_metric_expr(ds, agg, metric_column)
+    where, params = _build_where(ds, filters)
+    tbl = _qi(ds.table)
+
+    rows, total = cur.execute(
+        f"SELECT COUNT(*), {metric_expr} FROM {tbl}{where}", params
+    ).fetchone()
+
+    series: list[dict[str, Any]] = []
+    chosen_interval: Optional[str] = None
+    if date_column:
+        if date_column not in ds.column_names:
+            raise HTTPException(status_code=400, detail=f"Unknown date column {date_column!r}.")
+        if ds.type_of(date_column) != "date":
+            raise HTTPException(status_code=400, detail=f"{date_column!r} is not a date column.")
+        date_ident = _qi(date_column)
+        min_ts, max_ts = cur.execute(
+            f"SELECT MIN({date_ident}), MAX({date_ident}) FROM {tbl}{where}", params
+        ).fetchone()
+        if min_ts is not None and max_ts is not None:
+            span = max((max_ts - min_ts).total_seconds(), 1.0)
+            chosen_interval = _pick_interval(span, interval)
+            sql = (
+                f"SELECT date_trunc('{chosen_interval}', {date_ident}) AS bucket, "
+                f"{metric_expr} AS value FROM {tbl}{where} GROUP BY bucket ORDER BY bucket"
+            )
+            series = [
+                {"label": _jsonable(bucket), "value": _metric_value(value, agg)}
+                for bucket, value in cur.execute(sql, params).fetchall()
+            ]
+
+    drivers: list[dict[str, Any]] = []
+    if dimension_column:
+        if dimension_column not in ds.column_names:
+            raise HTTPException(status_code=400, detail=f"Unknown dimension column {dimension_column!r}.")
+        dim = _qi(dimension_column)
+        sql = (
+            f"SELECT CAST({dim} AS VARCHAR) AS label, {metric_expr} AS metric_value "
+            f"FROM {tbl}{where} GROUP BY label ORDER BY ABS(metric_value) DESC LIMIT 30"
+        )
+        drivers = [
+            {"label": str(label) if label is not None else "Blank", "value": _metric_value(value, agg)}
+            for label, value in cur.execute(sql, params).fetchall()
+        ]
+
+    return {
+        "agg": agg,
+        "metric_column": metric_column,
+        "date_column": date_column,
+        "dimension_column": dimension_column,
+        "row_count": int(rows),
+        "total": _metric_value(total, agg),
+        "interval": chosen_interval,
+        "series": series,
+        "drivers": drivers,
+    }
+
+
 if __name__ == "__main__":
     import argparse
 
