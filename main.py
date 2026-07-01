@@ -32,6 +32,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+import insights as insights_mod
+
 # ---------------------------------------------------------------------------
 # Configuration (environment-driven so deployments need no code changes).
 # ---------------------------------------------------------------------------
@@ -547,8 +549,10 @@ def dataset_query(
     ).fetchone()[0]
 
     offset = (page - 1) * page_size
+    # Expose DuckDB's stable rowid as __rowid so Evidence Mode can highlight the
+    # exact rows an insight is built on (it never renders as a normal column).
     cur.execute(
-        f"SELECT * FROM {_qi(ds.table)}{where}{order} LIMIT ? OFFSET ?",
+        f"SELECT *, rowid AS __rowid FROM {_qi(ds.table)}{where}{order} LIMIT ? OFFSET ?",
         [*params, page_size, offset],
     )
     cols = [d[0] for d in cur.description]
@@ -804,6 +808,60 @@ def dataset_compare(
         "series": series,
         "drivers": drivers,
     }
+
+
+# ---------------------------------------------------------------------------
+# Evidence Mode — evidence-backed insights.
+# ---------------------------------------------------------------------------
+
+@app.get("/datasets/{dataset_id}/insights")
+def dataset_insights(
+    dataset_id: str,
+    mode: str = Query("analyst", description="student | analyst | founder | manager | researcher"),
+    filters: Optional[str] = None,
+) -> dict[str, Any]:
+    """Compute the Evidence-Mode report: every insight is backed by real math,
+    exact numbers and the actual row ids that prove it (see insights.py)."""
+    ds = _get_dataset(dataset_id)
+    cur = _cursor()
+    where, params = _build_where(ds, filters)
+    report = insights_mod.compute_report(cur, ds.table, ds.columns, where, params, mode)
+    report["dataset_id"] = ds.id
+    report["mode"] = mode if mode in insights_mod._MODES else "analyst"
+    return report
+
+
+@app.get("/datasets/{dataset_id}/rows")
+def dataset_rows(
+    dataset_id: str,
+    rowids: str = Query(..., description="Comma-separated DuckDB rowids to fetch"),
+    filters: Optional[str] = None,
+) -> dict[str, Any]:
+    """Return the full data for specific rowids so the evidence drawer can show
+    the exact rows behind a claim. Ids are bound, never interpolated."""
+    ds = _get_dataset(dataset_id)
+    cur = _cursor()
+    try:
+        ids = [int(x) for x in rowids.split(",") if x.strip() != ""][:200]
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="rowids must be comma-separated integers.") from exc
+    if not ids:
+        return {"data": [], "columns": ds.columns}
+
+    where, params = _build_where(ds, filters)
+    placeholders = ",".join("?" for _ in ids)
+    clause = f"rowid IN ({placeholders})"
+    where = f"{where} AND {clause}" if where else f" WHERE {clause}"
+    cur.execute(
+        f"SELECT *, rowid AS __rowid FROM {_qi(ds.table)}{where} ORDER BY rowid",
+        [*params, *ids],
+    )
+    cols = [d[0] for d in cur.description]
+    rows = [{k: _jsonable(v) for k, v in zip(cols, r)} for r in cur.fetchall()]
+    # Preserve the caller's requested order (rowid order from SQL may differ).
+    by_id = {r["__rowid"]: r for r in rows}
+    ordered = [by_id[i] for i in ids if i in by_id]
+    return {"data": ordered, "columns": ds.columns}
 
 
 if __name__ == "__main__":
