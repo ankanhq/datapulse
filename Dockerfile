@@ -6,8 +6,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# App code.
-COPY main.py generate_data.py ./
+# App code. NOTE: keep this in sync with the modules main.py imports — insights.py
+# powers Evidence Mode and main.py imports it at startup, so it MUST be copied in
+# (otherwise the container crashes on boot with ModuleNotFoundError: insights).
+COPY main.py insights.py generate_data.py ./
 
 # Generate the smaller 100k-row production dataset at build time, so the image
 # is self-contained and no large data file needs to be committed or uploaded.
