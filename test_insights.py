@@ -233,6 +233,110 @@ def test_rows_endpoint_preserves_order_and_shape():
 # Direct unit test of the formulas (no HTTP).
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# Regression: NON-sample schemas must return HTTP 200 (never 500/503).
+# These are the exact shapes that crashed the insights worker before the fix.
+# --------------------------------------------------------------------------
+
+def _sales_csv():
+    # DATE column named 'order_date' (NOT 'timestamp'); this is the shape that
+    # 503'd — DuckDB DATE arithmetic in what_changed_most. 30 rows, 2 numerics.
+    rows = ["order_date,product,region,units,revenue"]
+    prods, regs = ["Widget", "Gadget", "Gizmo"], ["North", "South", "East", "West"]
+    for i in range(30):
+        rows.append(f"2024-{1 + i // 28:02d}-{1 + i % 28:02d},{prods[i % 3]},{regs[i % 4]},{i + 1},{(i + 1) * 12.5}")
+    return "\n".join(rows)
+
+def _nodate_csv():
+    rows = ["product,region,units,revenue"]
+    for i in range(30):
+        rows.append(f"{'ABC'[i % 3]},{'NS'[i % 2]},{i + 1},{(i + 1) * 3.0}")
+    return "\n".join(rows)
+
+def _onlytext_csv():
+    rows = ["product,region,status"]
+    for i in range(30):
+        rows.append(f"{'ABC'[i % 3]},{'NS'[i % 2]},{'ok' if i % 2 else 'bad'}")
+    return "\n".join(rows)
+
+def _tiny_csv():
+    return "a,b\n1,2\n3,4\n5,6\n"
+
+def _singlecat_csv():
+    rows = ["category,uid,amount"]
+    for i in range(40):
+        rows.append(f"OnlyOne,user_{i},{(i % 10) + 1.5}")
+    return "\n".join(rows)
+
+def _messy_csv():
+    # duplicate header 'name' + an all-empty column
+    rows = ["name,name,empty,val"]
+    for i in range(25):
+        rows.append(f"x{i},y{i},,{(i % 9) + 1}")
+    return "\n".join(rows)
+
+
+ALL_SCHEMAS = {
+    "sales_date_col": _sales_csv,
+    "no_date": _nodate_csv,
+    "only_text": _onlytext_csv,
+    "tiny_3_rows": _tiny_csv,
+    "single_category": _singlecat_csv,
+    "messy_dupe_headers_nulls": _messy_csv,
+}
+
+
+@pytest.mark.parametrize("name", list(ALL_SCHEMAS))
+@pytest.mark.parametrize("mode", ["analyst", "student", "founder", "manager", "researcher"])
+def test_insights_never_500s_on_any_schema(name, mode):
+    ds = _paste(ALL_SCHEMAS[name]())
+    r = client.get(f"/datasets/{ds}/insights", params={"mode": mode})
+    assert r.status_code == 200, f"{name}/{mode} -> {r.status_code}: {r.text[:300]}"
+    rep = r.json()
+    # valid, complete structure
+    for key in ("summary", "data_quality", "insights", "follow_up_questions"):
+        assert key in rep, f"{name}: missing {key}"
+    assert isinstance(rep["insights"], list) and len(rep["insights"]) >= 1
+    for ins in rep["insights"]:
+        assert REQUIRED_INSIGHT_KEYS <= set(ins), f"{name}: insight missing keys"
+        assert 0.0 <= ins["confidence"] <= 1.0
+        assert 0 <= ins["trust_score"] <= 100
+        assert all(isinstance(x, int) for x in ins["evidence_rows"])
+        # critical rule: any *claim* (non-limitation) carries the numbers proving it
+        if not ins.get("is_limitation"):
+            assert ins["supporting_metrics"], f"{name}: claim without supporting_metrics ({ins['id']})"
+
+
+def test_sales_date_schema_is_the_regression_and_computes_what_changed():
+    # The exact reproducer: a DATE column not named 'timestamp' must not 503, and
+    # what_changed_most must actually compute (not just degrade to a limitation).
+    ds = _paste(_sales_csv())
+    r = client.get(f"/datasets/{ds}/insights", params={"mode": "founder"})
+    assert r.status_code == 200
+    insights = r.json()["insights"]
+    wc = [i for i in insights if i["category"] == "what_changed_most" and not i["is_limitation"]]
+    assert wc, "what_changed_most should compute on a real DATE column"
+    m = wc[0]["supporting_metrics"]
+    assert "midpoint" in m and m["first_half_rows"] + m["second_half_rows"] > 0
+    assert wc[0]["evidence_rows"], "the what-changed claim must cite rows"
+
+
+def test_endpoint_returns_200_even_if_a_section_raises(monkeypatch):
+    # Force one section to blow up; the endpoint must still return 200 with a
+    # clearly-labelled limitation for that section (never a 500/503).
+    import insights as ins_mod
+
+    def boom(*a, **k):
+        raise RuntimeError("injected failure")
+
+    monkeypatch.setattr(ins_mod, "_correlation_insights", boom)
+    ds = _paste(_sales_csv())
+    r = client.get(f"/datasets/{ds}/insights")
+    assert r.status_code == 200
+    corr = [i for i in r.json()["insights"] if i["category"] == "correlations"]
+    assert corr and corr[0]["is_limitation"] is True
+
+
 def test_share_report_roundtrip():
     ds = _paste(_synthetic_csv())
     rep = client.get(f"/datasets/{ds}/insights").json()

@@ -829,11 +829,43 @@ def dataset_insights(
     filters: Optional[str] = None,
 ) -> dict[str, Any]:
     """Compute the Evidence-Mode report: every insight is backed by real math,
-    exact numbers and the actual row ids that prove it (see insights.py)."""
+    exact numbers and the actual row ids that prove it (see insights.py).
+
+    compute_report is self-guarding (per-section try/except + time budget), but we
+    also wrap the call here so a truly unexpected failure still returns HTTP 200
+    with a valid, honest report instead of a 500/503 that blanks the Evidence tab.
+    """
     ds = _get_dataset(dataset_id)
-    cur = _cursor()
     where, params = _build_where(ds, filters)
-    report = insights_mod.compute_report(cur, ds.table, ds.columns, where, params, mode)
+    if con is None:
+        raise HTTPException(status_code=503, detail="Server not ready.")
+    try:
+        report = insights_mod.compute_report(con, ds.table, ds.columns, where, params, mode)
+    except Exception:  # noqa: BLE001 - defence in depth; compute_report shouldn't raise
+        import traceback
+        traceback.print_exc()
+        report = {
+            "summary": {"rows": ds.row_count, "columns": len(ds.columns),
+                        "column_types": {c["name"]: c["type"] for c in ds.columns},
+                        "date_range": None, "key_numbers": {}},
+            "data_quality": {"missing_by_column": {}, "duplicate_rows": 0,
+                             "duplicate_example_rows": [],
+                             "small_sample_warning": {"triggered": False, "row_count": ds.row_count,
+                                                      "threshold": 30,
+                                                      "message": "Insights could not be computed for this dataset."}},
+            "insights": [{
+                "id": "insights_unavailable", "title": "Insights unavailable",
+                "category": "executive_summary",
+                "explanation": "The insight engine hit an unexpected error on this dataset. "
+                               "The rest of DataPulse (table, charts, export) still works.",
+                "why_it_matters": "No claim is shown because the computation did not complete.",
+                "confidence": 0.0, "trust_score": 0, "evidence_rows": [],
+                "evidence_columns": [c["name"] for c in ds.columns], "supporting_metrics": {},
+                "what_to_check_next": "Try a different slice, or re-upload the file.",
+                "is_limitation": True,
+            }],
+            "follow_up_questions": ["Is the data well-formed enough to analyse?"],
+        }
     report["dataset_id"] = ds.id
     report["mode"] = mode if mode in insights_mod._MODES else "analyst"
     return report

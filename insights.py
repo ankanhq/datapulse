@@ -39,10 +39,21 @@ Low confidence is always stated plainly in the ``explanation`` text.
 
 from __future__ import annotations
 
-from datetime import date, datetime
+import concurrent.futures as _futures
+import logging
+import os
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from itertools import combinations
 from typing import Any, Optional
+
+log = logging.getLogger("datapulse.insights")
+
+# Hard per-section time budget. Each insight section runs on its own cursor in a
+# worker thread; if it exceeds this it is abandoned and shown as a limitation, so
+# one slow/pathological query can never hang the request (see _guarded).
+SECTION_BUDGET_S = float(os.getenv("DATAPULSE_INSIGHT_SECTION_BUDGET", "12"))
+_POOL = _futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="insight")
 
 # ---------------------------------------------------------------------------
 # Thresholds (all tunable in one place).
@@ -230,17 +241,64 @@ def _insight(**kw) -> dict[str, Any]:
     return base
 
 
+def _limitation(name: str, category: str, cols_hint, reason: str) -> dict:
+    """A clearly-labelled placeholder card emitted when a section can't be computed.
+
+    Keeps the report honest and complete instead of failing the whole request:
+    the section is shown as a limitation (no claim, no numbers) rather than dropped.
+    """
+    return _insight(
+        id=f"{category}_unavailable",
+        title=f"{name} unavailable",
+        category=category,
+        explanation=f"The {name.lower()} check {reason}. It is shown as a limitation "
+                    "rather than a claim, so nothing here is asserted without evidence.",
+        why_it_matters="No conclusion is drawn from this section because its computation "
+                       "did not complete.",
+        confidence=0.0, trust_score=0, is_limitation=True,
+        evidence_columns=list(cols_hint or []),
+        what_to_check_next="Retry, or try a cleaner or larger slice of the data.",
+        notability=0.0,
+    )
+
+
+def _guarded(con, name: str, category: str, cols_hint, fn) -> list[dict]:
+    """Run one insight section on its own cursor under a hard time budget.
+
+    If it raises OR exceeds SECTION_BUDGET_S, we log it and return a limitation
+    card for that section instead of letting the exception kill the request. This
+    is what guarantees a single broken/slow check can never 500/503 the endpoint.
+    """
+    def work():
+        return fn(con.cursor())
+    try:
+        return _POOL.submit(work).result(timeout=SECTION_BUDGET_S) or []
+    except _futures.TimeoutError:
+        log.warning("insights: section %r exceeded %.0fs budget — degraded to limitation",
+                    name, SECTION_BUDGET_S)
+        return [_limitation(name, category, cols_hint,
+                            f"took longer than {int(SECTION_BUDGET_S)}s and was skipped to keep the report responsive")]
+    except Exception as exc:  # noqa: BLE001 - any failure degrades, never propagates
+        log.warning("insights: section %r failed: %r", name, exc, exc_info=True)
+        return [_limitation(name, category, cols_hint, f"could not be computed ({type(exc).__name__})")]
+
+
 # ---------------------------------------------------------------------------
 # Main entry point.
 # ---------------------------------------------------------------------------
 
-def compute_report(cur, table: str, columns: list[dict], where: str = "",
+def compute_report(con, table: str, columns: list[dict], where: str = "",
                    params: Optional[list] = None, mode: str = "analyst") -> dict[str, Any]:
     """Compute the full Evidence-Mode report for one (optionally filtered) dataset.
 
-    ``cur`` is a DuckDB cursor, ``table`` the internal table name, ``columns`` the
-    dataset's ``[{name, type, sql_type}]`` list, and ``where``/``params`` come from
-    the shared filter builder. Returns the JSON-serialisable report dict.
+    ``con`` is a DuckDB connection (each section gets its own cursor from it),
+    ``table`` the internal table name, ``columns`` the dataset's
+    ``[{name, type, sql_type}]`` list, and ``where``/``params`` come from the shared
+    filter builder.
+
+    Robustness contract: this ALWAYS returns a valid, JSON-serialisable report.
+    Every section is isolated (try/except + time budget); a catastrophic failure
+    still yields a minimal report rather than raising.
     """
     params = list(params or [])
     if mode not in _MODES:
@@ -250,14 +308,45 @@ def compute_report(cur, table: str, columns: list[dict], where: str = "",
     dates = [c["name"] for c in columns if c["type"] == "date"]
     texts = [c["name"] for c in columns if c["type"] == "text"]
     all_names = [c["name"] for c in columns]
-    type_map = {c["name"]: c["type"] for c in columns}
 
-    total = int(cur.execute(f"SELECT COUNT(*) FROM {_qi(table)}{where}", params).fetchone()[0])
+    try:
+        return _finalize(_compute(con, table, columns, where, params, mode,
+                                  numeric, dates, texts, all_names))
+    except Exception as exc:  # noqa: BLE001 - last-resort guard: never raise to the caller
+        log.error("insights: catastrophic failure, returning minimal report: %r", exc, exc_info=True)
+        return _finalize({
+            "summary": {"rows": None, "columns": len(all_names),
+                        "column_types": {c["name"]: c["type"] for c in columns},
+                        "date_range": None, "key_numbers": {}},
+            "data_quality": {"missing_by_column": {}, "duplicate_rows": 0,
+                             "duplicate_example_rows": [],
+                             "small_sample_warning": {"triggered": False, "row_count": None,
+                                                      "threshold": SMALL_SAMPLE,
+                                                      "message": "Data quality could not be assessed."}},
+            "insights": [_limitation("Insights", "executive_summary", all_names,
+                                     "could not be computed for this dataset")],
+            "follow_up_questions": ["Is the data well-formed enough to analyse?"],
+        })
 
-    # ---- data quality: per-column missingness + duplicate rows -------------
-    missing_by_column = _missing_by_column(cur, table, columns, where, params, total)
+
+def _compute(con, table, columns, where, params, mode, numeric, dates, texts, all_names) -> dict:
+    """Inner body of compute_report; wrapped by the last-resort guard above."""
+    base = con.cursor()
+    total = int(base.execute(f"SELECT COUNT(*) FROM {_qi(table)}{where}", params).fetchone()[0])
+
+    # ---- data quality: per-column missingness + duplicate rows (each guarded) --
+    try:
+        missing_by_column = _missing_by_column(con.cursor(), table, columns, where, params, total)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("insights: missing-by-column failed: %r", exc)
+        missing_by_column = {c["name"]: {"missing": 0, "missing_fraction": 0.0,
+                                         "missing_pct": 0.0, "type": c["type"]} for c in columns}
     missing_frac = {k: v["missing_fraction"] for k, v in missing_by_column.items()}
-    duplicate_rows, dup_example_rows = _duplicates(cur, table, all_names, where, params, total)
+    try:
+        duplicate_rows, dup_example_rows = _duplicates(con.cursor(), table, all_names, where, params, total)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("insights: duplicate detection failed: %r", exc)
+        duplicate_rows, dup_example_rows = 0, []
     small_sample = total < SMALL_SAMPLE
 
     data_quality = {
@@ -278,11 +367,17 @@ def compute_report(cur, table: str, columns: list[dict], where: str = "",
     }
 
     # ---- summary ------------------------------------------------------------
-    summary = _summary(cur, table, columns, numeric, dates, texts, where, params, total)
+    try:
+        summary = _summary(con.cursor(), table, columns, numeric, dates, texts, where, params, total)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("insights: summary failed: %r", exc)
+        summary = {"rows": total, "columns": len(columns),
+                   "column_types": {c["name"]: c["type"] for c in columns},
+                   "date_range": None, "key_numbers": {}}
 
     # If there is nothing to analyse, return early with an honest limitation.
     if total == 0:
-        return _finalize({
+        return {
             "summary": summary,
             "data_quality": data_quality,
             "insights": [_insight(
@@ -294,14 +389,67 @@ def compute_report(cur, table: str, columns: list[dict], where: str = "",
                 what_to_check_next="Clear or widen the active filters.",
             )],
             "follow_up_questions": ["Which filter is excluding all rows?"],
-        })
+        }
 
     facts_exec = _exec_facts(summary, total, numeric, dates, texts)
     insights: list[dict] = []
 
-    # executive summary (descriptive — effect/consistency = 1)
+    # Each section runs isolated: its own cursor, a try/except and a time budget.
+    insights += _guarded(con, "Executive summary", "executive_summary", all_names,
+        lambda cur: [_exec_card(cur, table, where, params, mode, total, all_names, numeric,
+                                dates, texts, summary, missing_frac, facts_exec)])
+
+    findings: list[dict] = []
+    findings += _guarded(con, "Data completeness", "missing_data", list(missing_by_column),
+        lambda cur: _missing_insights(cur, table, columns, where, params, total, missing_by_column, mode))
+    findings += _guarded(con, "Hidden patterns", "hidden_patterns", texts + dates,
+        lambda cur: (_concentration_insights(cur, table, texts, where, params, total, missing_frac, mode)
+                     + _trend_insights(cur, table, dates, numeric, where, params, total, missing_frac, mode)))
+    findings += _guarded(con, "Correlations", "correlations", numeric,
+        lambda cur: _correlation_insights(cur, table, numeric, where, params, missing_frac, mode))
+    findings += _guarded(con, "Anomalies", "anomalies", numeric,
+        lambda cur: _anomaly_insights(cur, table, numeric, where, params, total, missing_frac, mode))
+    findings += _guarded(con, "What changed most", "what_changed_most", dates + texts,
+        lambda cur: _what_changed_insights(cur, table, dates, texts, numeric, where, params, missing_frac, mode))
+
+    # top_insights: the 3 most notable *real* findings (not limitations), ranked.
+    try:
+        ranked = sorted(
+            [f for f in findings if not f["is_limitation"]],
+            key=lambda f: f["_notability"], reverse=True,
+        )
+        for rank, src in enumerate(ranked[:3], start=1):
+            top = dict(src)
+            top["id"] = f"top_insight_{rank}"
+            top["category"] = "top_insights"
+            top["title"] = f"#{rank}: {src['title']}"
+            top["supporting_metrics"] = {"rank": rank, "source_insight": src["id"],
+                                         **src["supporting_metrics"]}
+            insights.append(top)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("insights: ranking top insights failed: %r", exc)
+
+    insights += findings
+
+    try:
+        follow_ups = _follow_ups(findings, data_quality, dates, numeric, texts)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("insights: follow-ups failed: %r", exc)
+        follow_ups = ["What question are you hoping this dataset can answer?"]
+
+    return {
+        "summary": summary,
+        "data_quality": data_quality,
+        "insights": insights,
+        "follow_up_questions": follow_ups,
+    }
+
+
+def _exec_card(cur, table, where, params, mode, total, all_names, numeric, dates, texts,
+               summary, missing_frac, facts_exec) -> dict:
+    """The descriptive executive-summary card (effect/consistency = 1)."""
     exec_rows = _rowids(cur, table, where, params, limit=5)
-    insights.append(_insight(
+    return _insight(
         id="executive_summary", title="What this dataset is", category="executive_summary",
         explanation=_LEAD_IN[mode] + (
             f"This dataset has {total:,} rows and {len(all_names)} columns "
@@ -321,42 +469,7 @@ def compute_report(cur, table: str, columns: list[dict], where: str = "",
         },
         what_to_check_next="Scan the first rows in the table to sanity-check the columns.",
         notability=0.0,  # never surfaced as a 'top' finding
-    ))
-
-    # analytical findings (each a real computation)
-    findings: list[dict] = []
-    findings += _missing_insights(cur, table, columns, where, params, total, missing_by_column, mode)
-    findings += _concentration_insights(cur, table, texts, where, params, total, missing_frac, mode)
-    findings += _trend_insights(cur, table, dates, numeric, where, params, total, missing_frac, mode)
-    findings += _correlation_insights(cur, table, numeric, where, params, missing_frac, mode)
-    findings += _anomaly_insights(cur, table, numeric, where, params, total, missing_frac, mode)
-    findings += _what_changed_insights(cur, table, dates, texts, numeric, where, params, missing_frac, mode)
-
-    # top_insights: the 3 most notable *real* findings (not limitations), ranked.
-    ranked = sorted(
-        [f for f in findings if not f["is_limitation"]],
-        key=lambda f: f["_notability"], reverse=True,
     )
-    for rank, src in enumerate(ranked[:3], start=1):
-        top = dict(src)
-        top["id"] = f"top_insight_{rank}"
-        top["category"] = "top_insights"
-        top["title"] = f"#{rank}: {src['title']}"
-        top["supporting_metrics"] = {"rank": rank, "source_insight": src["id"],
-                                     **src["supporting_metrics"]}
-        insights.append(top)
-
-    insights += findings
-
-    # ---- follow-up questions (derived from what we actually found) ----------
-    follow_ups = _follow_ups(findings, data_quality, dates, numeric, texts)
-
-    return _finalize({
-        "summary": summary,
-        "data_quality": data_quality,
-        "insights": insights,
-        "follow_up_questions": follow_ups,
-    })
 
 
 def _finalize(report: dict) -> dict:
@@ -809,10 +922,15 @@ def _what_changed_insights(cur, table, dates, texts, numeric, where, params, mis
         )]
     date_col = dates[0]
     dident = _qi(date_col)
-    mn, mx = cur.execute(
-        f"SELECT MIN({dident}), MAX({dident}) FROM {_qi(table)}{where}", params
+    # epoch(CAST(... AS TIMESTAMP)) makes the split type-agnostic: a DATE column
+    # (e.g. order_date) and a TIMESTAMP column both reduce to seconds-since-epoch.
+    # This avoids DuckDB's "No function matches +(DATE, DOUBLE)" binder error that
+    # naive midpoint arithmetic (MIN + (MAX-MIN)/2) hits on DATE-typed columns.
+    eexpr = f"epoch(CAST({dident} AS TIMESTAMP))"
+    min_e, max_e = cur.execute(
+        f"SELECT MIN({eexpr}), MAX({eexpr}) FROM {_qi(table)}{where}", params
     ).fetchone()
-    if mn is None or mx is None or mn == mx:
+    if min_e is None or max_e is None or float(min_e) == float(max_e):
         return [_insight(
             id="what_changed", title="Date column doesn't span a range",
             category="what_changed_most",
@@ -825,19 +943,20 @@ def _what_changed_insights(cur, table, dates, texts, numeric, where, params, mis
         )]
 
     # midpoint split; group by the first text column if present, else overall count
-    mid_sql = f"SELECT MIN({dident}) + (MAX({dident}) - MIN({dident})) / 2 FROM {_qi(table)}{where}"
-    midpoint = cur.execute(mid_sql, params).fetchone()[0]
+    mid_e = (float(min_e) + float(max_e)) / 2.0
+    midpoint = datetime.fromtimestamp(mid_e, tz=timezone.utc).replace(tzinfo=None).isoformat()
+    before, after = f"{eexpr} < ?", f"{eexpr} >= ?"
     dim = texts[0] if texts else None
 
     if dim:
         gid = _qi(dim)
         first = dict(cur.execute(
             f"SELECT CAST({gid} AS VARCHAR), COUNT(*) FROM {_qi(table)}"
-            f"{_augment(where, f'{dident} < ?')} GROUP BY 1", [*params, midpoint]
+            f"{_augment(where, before)} GROUP BY 1", [*params, mid_e]
         ).fetchall())
         second = dict(cur.execute(
             f"SELECT CAST({gid} AS VARCHAR), COUNT(*) FROM {_qi(table)}"
-            f"{_augment(where, f'{dident} >= ?')} GROUP BY 1", [*params, midpoint]
+            f"{_augment(where, after)} GROUP BY 1", [*params, mid_e]
         ).fetchall())
         labels = set(first) | set(second)
         movers = []
@@ -867,7 +986,7 @@ def _what_changed_insights(cur, table, dates, texts, numeric, where, params, mis
             trust_score=_trust(n_first + n_second, missing_frac.get(dim, 0.0), min(1.0, effect + 0.2)),
             evidence_rows=ev_rows, evidence_columns=[date_col, dim],
             supporting_metrics={"date_column": date_col, "dimension": dim,
-                                "midpoint": _j(midpoint), "top_movers": movers[:6],
+                                "midpoint": midpoint, "top_movers": movers[:6],
                                 "first_half_rows": n_first, "second_half_rows": n_second},
             what_to_check_next=f"Investigate what drove '{top['label']}' between the two halves.",
             notability=effect,
@@ -875,10 +994,10 @@ def _what_changed_insights(cur, table, dates, texts, numeric, where, params, mis
 
     # no category — report overall volume change between halves
     n_first = int(cur.execute(
-        f"SELECT COUNT(*) FROM {_qi(table)}{_augment(where, f'{dident} < ?')}", [*params, midpoint]
+        f"SELECT COUNT(*) FROM {_qi(table)}{_augment(where, before)}", [*params, mid_e]
     ).fetchone()[0])
     n_second = int(cur.execute(
-        f"SELECT COUNT(*) FROM {_qi(table)}{_augment(where, f'{dident} >= ?')}", [*params, midpoint]
+        f"SELECT COUNT(*) FROM {_qi(table)}{_augment(where, after)}", [*params, mid_e]
     ).fetchone()[0])
     delta = n_second - n_first
     base = max(1, n_first)
@@ -892,7 +1011,7 @@ def _what_changed_insights(cur, table, dates, texts, numeric, where, params, mis
         confidence=_confidence(n_first + n_second, effect),
         trust_score=_trust(n_first + n_second, missing_frac.get(date_col, 0.0), min(1.0, effect + 0.2)),
         evidence_columns=[date_col],
-        supporting_metrics={"date_column": date_col, "midpoint": _j(midpoint),
+        supporting_metrics={"date_column": date_col, "midpoint": midpoint,
                             "first_half_rows": n_first, "second_half_rows": n_second, "delta": delta},
         what_to_check_next="Add a category column to see which segment drove the shift.",
         notability=effect,
