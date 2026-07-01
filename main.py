@@ -17,6 +17,7 @@ import csv
 import io
 import json
 import os
+import re
 import tempfile
 import threading
 import time
@@ -58,6 +59,13 @@ DATASET_TTL_SECONDS = int(os.getenv("DATAPULSE_DATASET_TTL", "1800"))  # 30 min
 # The sample is capped so it loads instantly and stays light regardless of how
 # big the source file is.
 SAMPLE_ROW_CAP = int(os.getenv("DATAPULSE_SAMPLE_ROWS", "50000"))
+
+# Directory for shared Evidence-Mode reports. NOTE: persistence here is
+# best-effort — free hosts (Render free tier) use an ephemeral filesystem that is
+# wiped on redeploy/restart, so shared links may expire. For durable sharing this
+# would move to object storage or a database.
+REPORTS_DIR = os.getenv("DATAPULSE_REPORTS_DIR", "./.reports")
+MAX_REPORT_BYTES = 4 * 1024 * 1024  # guard against oversized report payloads
 
 # Display/serving caps.
 MAX_CHART_BUCKETS = 2_000      # time-series granularity guard
@@ -862,6 +870,61 @@ def dataset_rows(
     by_id = {r["__rowid"]: r for r in rows}
     ordered = [by_id[i] for i in ids if i in by_id]
     return {"data": ordered, "columns": ds.columns}
+
+
+# ---------------------------------------------------------------------------
+# Shared reports — persist a computed report and serve it read-only by token.
+# ---------------------------------------------------------------------------
+
+class ReportSubmission(BaseModel):
+    report: dict[str, Any]
+    dataset_name: Optional[str] = None
+
+
+_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+@app.post("/reports")
+def create_report(body: ReportSubmission) -> dict[str, Any]:
+    """Store a computed Evidence-Mode report under a uuid token and return a
+    read-only URL. Persistence is best-effort (see REPORTS_DIR note)."""
+    payload = {
+        "report": body.report,
+        "dataset_name": body.dataset_name,
+        "created_at": time.time(),
+    }
+    encoded = json.dumps(payload).encode("utf-8")
+    if len(encoded) > MAX_REPORT_BYTES:
+        raise HTTPException(status_code=413, detail="Report is too large to share.")
+
+    token = uuid.uuid4().hex
+    try:
+        os.makedirs(REPORTS_DIR, exist_ok=True)
+        with open(os.path.join(REPORTS_DIR, f"{token}.json"), "wb") as fh:
+            fh.write(encoded)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Could not save the report on this server (storage is ephemeral "
+                   "on the free tier). Please try again.",
+        ) from exc
+    return {"token": token, "url": f"/report/{token}"}
+
+
+@app.get("/reports/{token}")
+def get_report(token: str) -> dict[str, Any]:
+    """Return a previously stored report by token (read-only)."""
+    if not _TOKEN_RE.match(token):  # tokens are uuid4 hex -> no path traversal
+        raise HTTPException(status_code=400, detail="Invalid report token.")
+    path = os.path.join(REPORTS_DIR, f"{token}.json")
+    if not os.path.exists(path):
+        raise HTTPException(
+            status_code=404,
+            detail="This shared report was not found. Links are best-effort and may "
+                   "expire when the free-tier server restarts.",
+        )
+    with open(path, "rb") as fh:
+        return json.loads(fh.read())
 
 
 if __name__ == "__main__":

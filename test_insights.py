@@ -233,6 +233,26 @@ def test_rows_endpoint_preserves_order_and_shape():
 # Direct unit test of the formulas (no HTTP).
 # --------------------------------------------------------------------------
 
+def test_share_report_roundtrip():
+    ds = _paste(_synthetic_csv())
+    rep = client.get(f"/datasets/{ds}/insights").json()
+    created = client.post("/reports", json={"report": rep, "dataset_name": "synthetic"})
+    assert created.status_code == 200, created.text
+    token = created.json()["token"]
+    assert created.json()["url"] == f"/report/{token}"
+
+    got = client.get(f"/reports/{token}")
+    assert got.status_code == 200
+    stored = got.json()
+    assert stored["dataset_name"] == "synthetic"
+    assert stored["report"]["summary"]["rows"] == rep["summary"]["rows"]
+
+
+def test_share_report_bad_token():
+    assert client.get("/reports/not-a-real-token").status_code == 400
+    assert client.get("/reports/" + "a" * 32).status_code == 404
+
+
 def test_score_formulas_bounds():
     assert insights_mod._confidence(0, 1.0) == 0.0          # no rows -> no confidence
     assert insights_mod._confidence(1000, 1.0) == 1.0       # saturates at 1
