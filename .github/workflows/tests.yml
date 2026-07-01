@@ -1,0 +1,31 @@
+name: tests
+
+# Runs the Evidence Mode + API test suite on every push/PR so the schema
+# regressions (insights must return 200 on non-sample schemas) can't come back.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+      - name: Generate a small sample dataset
+        # The real sample CSV isn't committed (it's large/gitignored), so build a
+        # tiny one for the sample-backed tests — same approach as the Dockerfile.
+        run: python generate_data.py --rows 3000 --out data_ci_sample.csv
+      - name: Run tests
+        env:
+          DATAPULSE_DATA_FILE: ./data_ci_sample.csv
+          DATAPULSE_SAMPLE_ROWS: "3000"
+          DATAPULSE_REPORTS_DIR: ./.ci_reports
+        run: pytest -q
