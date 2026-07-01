@@ -9,6 +9,10 @@ charts, and CSV export — no signup. **Live:** https://datapulse-frontend.verce
 This repo is the API: **FastAPI + DuckDB**, packaged with Docker. The
 [frontend](https://github.com/ankanhq/datapulse-frontend) is a separate React app.
 
+## What's new
+- **Evidence Mode** — turn any spreadsheet into a plain-English story with the proof attached.
+- **Compare Mode** — compare two slices of your data and see exactly what changed and why.
+
 ## What it does
 
 A visitor uploads a CSV/Excel file or pastes spreadsheet text (or pastes a file
@@ -31,6 +35,23 @@ DuckDB, and the temp file is deleted immediately. Each dataset is keyed by an
 opaque id so one visitor never sees another's data, and datasets are evicted once
 the process holds too many or they go stale — which keeps memory bounded on a
 free-tier host. Uploads are capped at **25 MB**.
+
+### Evidence Mode
+Turns your spreadsheet into a set of plain-English insights — with the proof
+attached. Every card is computed straight from your rows (real statistics, no
+LLM): an executive summary, the most notable findings ranked, category
+concentration, outliers, missing-data checks, correlations, and what changed most
+over time. Each insight carries a confidence score and a trust score, and a
+**Show evidence** button opens the exact rows and the calculation behind the
+claim. Use **Explain for** (Student / Analyst / Founder / Manager / Researcher) to
+reword the story, and **Generate report** to create a read-only shareable page.
+
+![Evidence Mode](evidence.png)
+
+### Compare Mode
+Compare two slices of your data — two date ranges, two filter sets, or a second
+uploaded file — and get the delta, % change, top movers, and a plain-English
+reason the metric moved.
 
 ## Tech stack
 
@@ -105,6 +126,21 @@ load endpoints.
 | GET    | `/datasets/{id}/query`        | Paginated, sortable, filterable rows.                          |
 | GET    | `/datasets/{id}/export`       | Stream the filtered + sorted view as CSV.                      |
 | GET    | `/datasets/{id}/chart`        | Aggregated data for charting (adapts to the column type).      |
+| GET    | `/datasets/{id}/insights`     | Computed insight report — accepts `mode` and `filters`.        |
+| GET    | `/datasets/{id}/rows`         | The exact supporting rows behind an insight — accepts `rowids`.|
+| GET    | `/datasets/{id}/compare`      | Aggregate snapshot used by Compare Mode.                       |
+| POST   | `/reports`                    | Save a read-only shared report; returns a token.               |
+| GET    | `/reports/{token}`            | Open a previously saved shared report.                         |
+
+The Evidence Mode endpoints:
+
+- `GET /datasets/{id}/insights?mode=&filters=` — computed insight report
+- `GET /datasets/{id}/rows?rowids=` — the exact supporting rows behind an insight
+- `POST /reports` and `GET /reports/{token}` — save/open a read-only shared report
+- `GET /datasets/{id}/compare` — aggregate snapshot used by Compare Mode
+
+All insights are computed with **DuckDB + numpy** — no external AI service, and no
+API keys.
 
 Each load endpoint returns `{ dataset_id, name, source, row_count, columns }`,
 where `columns` is `[{ name, type, sql_type }]` and `type` is one of
