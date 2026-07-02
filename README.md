@@ -190,3 +190,13 @@ path as a normal CSV.
 See [DEPLOY.md](DEPLOY.md) for deploying the backend to Render and the frontend
 to Vercel.
 
+### Keep-alive
+
+Render's free tier sleeps the service after ~15 minutes of inactivity, so the
+next visitor waits ~30s for a cold start. A scheduled GitHub Actions workflow
+([.github/workflows/keepalive.yml](.github/workflows/keepalive.yml)) pings `GET /`
+every 10 minutes to keep the server warm during the day. It's best-effort (GitHub
+may delay scheduled runs) and doesn't guarantee 24/7 uptime. Point it at your own
+deployment by setting a `KEEPALIVE_URL` repository variable; otherwise it targets
+the default backend URL.
+

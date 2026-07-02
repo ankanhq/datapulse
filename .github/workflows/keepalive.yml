@@ -1,0 +1,25 @@
+name: keep-alive
+
+# The backend runs on Render's free tier, which sleeps after ~15 min of
+# inactivity and then takes ~30s to cold-start on the next request. This pings
+# the health endpoint every 10 minutes so day-to-day visitors hit a warm server.
+# It's best-effort: GitHub may delay scheduled runs under load, and this does not
+# keep the service up 24/7 (nor is it meant to).
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping the health endpoint
+        env:
+          # Override in repo settings (Variables) if the backend URL changes.
+          API_URL: ${{ vars.KEEPALIVE_URL || 'https://datapulse-api-gm5r.onrender.com/' }}
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 "$API_URL" || echo "000")
+          echo "GET $API_URL -> $code"
+          # Don't fail the workflow on a transient blip; the next run will retry.
+          if [ "$code" != "200" ]; then echo "::warning::health check returned $code"; fi
