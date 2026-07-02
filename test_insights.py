@@ -12,16 +12,34 @@ Run:  pytest -q   (from the backend repo root)
 """
 
 import os
+import tempfile
+import time
 
 # Use the small sample file with a tiny cap so the suite is fast and deterministic.
 os.environ.setdefault("DATAPULSE_DATA_FILE", "./data_100k.csv")
 os.environ.setdefault("DATAPULSE_SAMPLE_ROWS", "3000")
+# Auth + persistence config for tests: a known HS256 secret (so we can mint valid
+# tokens) and a throwaway SQLite metadata store.
+os.environ.setdefault("SUPABASE_JWT_SECRET", "test-jwt-secret-at-least-32-bytes-long-000")
+os.environ.setdefault("DATABASE_URL", f"sqlite:///{tempfile.mkdtemp()}/datapulse_test.db")
 
+import jwt
 import pytest
 from fastapi.testclient import TestClient
 
 import main
 import insights as insights_mod
+
+TEST_USER = "user-aaaa-1111"
+
+
+def _token(sub=TEST_USER, email="a@example.com"):
+    """Mint a valid HS256 Supabase-style access token for a user id."""
+    return jwt.encode(
+        {"sub": sub, "email": email, "aud": "authenticated", "exp": int(time.time()) + 3600},
+        os.environ["SUPABASE_JWT_SECRET"], algorithm="HS256",
+    )
+
 
 # TestClient only runs the app's lifespan (which opens the DuckDB connection)
 # when used as a context manager, so enter it once for the whole session.
@@ -32,6 +50,8 @@ client = None
 def _app_lifespan():
     global client
     with TestClient(main.app) as c:
+        # Authenticate every request as TEST_USER by default.
+        c.headers.update({"Authorization": f"Bearer {_token()}"})
         client = c
         yield
 
@@ -501,6 +521,82 @@ def test_ssrf_guard_unwraps_nat64(monkeypatch):
     monkeypatch.setattr(main.socket, "getaddrinfo", fake_getaddrinfo("64:ff9b::a00:5"))  # 10.0.0.5
     with pytest.raises(Exception):
         main._reject_if_private("internal.example")
+
+
+def test_endpoints_require_a_valid_token():
+    # A bare client with no Authorization header must be rejected everywhere.
+    anon = TestClient(main.app)
+    assert anon.post("/datasets/sample").status_code == 401
+    assert anon.get("/datasets").status_code == 401
+    assert anon.get("/datasets/whatever/summary").status_code == 401
+    # A garbage bearer token is also 401.
+    bad = anon.post("/datasets/sample", headers={"Authorization": "Bearer not-a-jwt"})
+    assert bad.status_code == 401
+
+
+def test_datasets_are_private_per_user():
+    # User A creates a dataset; user B must not be able to read it (403), and the
+    # list endpoint only shows each user their own.
+    a_headers = {"Authorization": f"Bearer {_token(sub='owner-A', email='a@x.com')}"}
+    b_headers = {"Authorization": f"Bearer {_token(sub='owner-B', email='b@x.com')}"}
+
+    ds = client.post("/datasets/text", json={"text": "x,y\n1,2\n3,4\n", "name": "A-data"},
+                     headers=a_headers).json()["dataset_id"]
+
+    assert client.get(f"/datasets/{ds}/summary", headers=a_headers).status_code == 200
+    assert client.get(f"/datasets/{ds}/summary", headers=b_headers).status_code == 403
+    assert client.get(f"/datasets/{ds}/insights", headers=b_headers).status_code == 403
+
+    a_list = client.get("/datasets", headers=a_headers).json()["datasets"]
+    b_list = client.get("/datasets", headers=b_headers).json()["datasets"]
+    assert any(d["dataset_id"] == ds for d in a_list)
+    assert all(d["dataset_id"] != ds for d in b_list)
+
+
+def test_reports_are_private_per_user():
+    a_headers = {"Authorization": f"Bearer {_token(sub='rep-A')}"}
+    b_headers = {"Authorization": f"Bearer {_token(sub='rep-B')}"}
+    token = client.post("/reports", json={"report": {"insights": []}, "dataset_name": "d"},
+                        headers=a_headers).json()["token"]
+    assert client.get(f"/reports/{token}", headers=a_headers).status_code == 200
+    assert client.get(f"/reports/{token}", headers=b_headers).status_code == 403
+
+
+def test_url_dataset_metadata_survives_restart(monkeypatch):
+    # A URL-backed dataset must reload from the persistent store after the in-memory
+    # registry is cleared (simulating a backend restart), and stay listed.
+    monkeypatch.setattr(main, "_reject_if_private", lambda host: None)
+    owner = {"Authorization": f"Bearer {_token(sub='persist-user')}"}
+    state = {"body": "date,val\n2025-01-01,1\n2025-01-02,2\n2025-01-03,3\n", "ctype": "text/csv"}
+    with _csv_server(state) as url:
+        ds = client.post("/datasets/url", json={"url": url}, headers=owner).json()["dataset_id"]
+
+        # Simulate a restart: wipe the in-memory registry (metadata stays in the DB).
+        main._registry.clear()
+
+        # Still listed (served from the store) ...
+        listed = client.get("/datasets", headers=owner).json()["datasets"]
+        assert any(d["dataset_id"] == ds for d in listed)
+        # ... and reloadable/queryable (re-fetched from the source URL).
+        r = client.get(f"/datasets/{ds}/summary", headers=owner)
+        assert r.status_code == 200, r.text
+
+
+def test_jwks_asymmetric_token_is_accepted(monkeypatch):
+    # Simulate the NEW asymmetric signing keys: sign an ES256 token and make the
+    # JWKS client return its public key, proving non-HS256 verification works.
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    priv = ec.generate_private_key(ec.SECP256R1())
+    es_token = jwt.encode({"sub": "ecc-user", "exp": int(time.time()) + 3600},
+                          priv, algorithm="ES256")
+
+    class _FakeKey:
+        key = priv.public_key()
+
+    monkeypatch.setattr(main.auth, "_get_jwk_client",
+                        lambda: type("C", (), {"get_signing_key_from_jwt": lambda self, t: _FakeKey()})())
+    assert main.auth.user_id_from_token(es_token) == "ecc-user"
 
 
 def test_share_report_roundtrip():

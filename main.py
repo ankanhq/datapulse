@@ -33,11 +33,13 @@ from typing import Any, Iterator, Optional
 from urllib.parse import urlparse
 
 import duckdb
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+import auth
+import db
 import insights as insights_mod
 
 # ---------------------------------------------------------------------------
@@ -110,6 +112,7 @@ class Dataset:
     row_count: int
     source: str                     # "upload" | "paste" | "sample" | "url"
     name: str
+    user_id: str = ""               # owner (Supabase user id) — enforced on access
     source_url: Optional[str] = None  # set when source == "url" (re-fetchable)
     created_at: float = field(default_factory=time.time)
     last_access: float = field(default_factory=time.time)
@@ -145,6 +148,7 @@ _lock = threading.Lock()
 async def lifespan(app: FastAPI):
     global con
     con = duckdb.connect(database=":memory:")
+    db.init_db()  # open the metadata store (Postgres in prod, SQLite locally)
     print(f"[startup] DataPulse ready. Sample source: {SAMPLE_FILE_PATH!r}. "
           f"Limits: {MAX_UPLOAD_BYTES // (1024*1024)}MB/file, "
           f"{MAX_DATASETS} datasets, {DATASET_TTL_SECONDS}s TTL.")
@@ -216,27 +220,84 @@ def _evict_locked() -> None:
         del _registry[oldest]
 
 
-def _get_dataset(dataset_id: str) -> Dataset:
-    """Fetch a dataset by id, bumping its access time; 404 if missing/expired."""
+def require_user(authorization: Optional[str] = Header(None)) -> str:
+    """FastAPI dependency: verify the Supabase bearer token and return the user id.
+
+    401 if the header is missing/malformed or the token can't be verified.
+    """
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Sign in required (missing bearer token).")
+    token = authorization.split(" ", 1)[1].strip()
+    try:
+        return auth.user_id_from_token(token)
+    except auth.AuthError:
+        raise HTTPException(status_code=401, detail="Invalid or expired session. Please sign in again.")
+
+
+def _is_expired(ds: Dataset) -> bool:
+    return time.time() - ds.last_access > DATASET_TTL_SECONDS
+
+
+def _reload_dataset_locked(meta: dict) -> Dataset:
+    """Rebuild a persisted dataset's in-memory DuckDB table. Assumes ``_lock`` held.
+
+    Only URL-backed (re-fetchable) and sample datasets can be reloaded after a
+    restart/eviction; upload/paste data is not persisted, so we say so plainly.
+    """
+    assert con is not None
+    dataset_id, source = meta["id"], meta["source"]
+    table = f"ds_{dataset_id}"
+    if source == "url" and meta.get("source_url"):
+        path = _fetch_csv_url(meta["source_url"])
+        try:
+            columns, row_count = _build_table_locked(table, path, None)
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    elif source == "sample" and os.path.exists(SAMPLE_FILE_PATH):
+        columns, row_count = _build_table_locked(table, SAMPLE_FILE_PATH, SAMPLE_ROW_CAP)
+    else:
+        raise HTTPException(
+            status_code=404,
+            detail="This dataset's data isn't available anymore (uploaded data isn't kept "
+                   "after a restart). Please re-upload it.",
+        )
+    ds = Dataset(id=dataset_id, table=table, columns=columns, row_count=row_count,
+                 source=source, name=meta["name"], user_id=meta["user_id"],
+                 source_url=meta.get("source_url"),
+                 created_at=meta.get("created_at") or time.time())
+    _registry[dataset_id] = ds
+    db.save_dataset(dataset_id, ds.user_id, ds.name, ds.source, ds.source_url,
+                    ds.columns, ds.row_count, ds.created_at)
+    _evict_locked()
+    return ds
+
+
+def _get_dataset(dataset_id: str, user_id: str) -> Dataset:
+    """Fetch a dataset the caller owns, reloading from the store if needed.
+
+    404 if unknown, 403 if it belongs to another user.
+    """
+    assert con is not None
     with _lock:
         ds = _registry.get(dataset_id)
-        if ds is None:
-            raise HTTPException(
-                status_code=404,
-                detail="Dataset not found. It may have expired — please upload your "
-                       "CSV again or load the sample data.",
-            )
-        if time.time() - ds.last_access > DATASET_TTL_SECONDS:
-            assert con is not None
+        if ds is not None and not _is_expired(ds):
+            if ds.user_id != user_id:
+                raise HTTPException(status_code=403, detail="You don't have access to this dataset.")
+            ds.last_access = time.time()
+            return ds
+        if ds is not None:  # expired -> drop the stale in-memory table, then reload
             con.execute(f"DROP TABLE IF EXISTS {_qi(ds.table)}")
             del _registry[dataset_id]
-            raise HTTPException(
-                status_code=404,
-                detail="Dataset expired. Please upload your CSV again or load the "
-                       "sample data.",
-            )
-        ds.last_access = time.time()
-        return ds
+
+        meta = db.get_dataset(dataset_id)
+        if meta is None:
+            raise HTTPException(status_code=404, detail="Dataset not found.")
+        if meta["user_id"] != user_id:
+            raise HTTPException(status_code=403, detail="You don't have access to this dataset.")
+        return _reload_dataset_locked(meta)
 
 
 def _build_table_locked(table: str, path: str, row_cap: Optional[int]) -> tuple[list[dict], int]:
@@ -251,8 +312,10 @@ def _build_table_locked(table: str, path: str, row_cap: Optional[int]) -> tuple[
         # Tolerant read: skip bad lines and pad ragged rows rather than
         # crashing, but still surface a clean error if nothing usable comes
         # out. sample_size=-1 scans the whole (<=25MB) file for type detection.
+        # OR REPLACE so reloading a persisted dataset into its deterministic table
+        # name (ds_<id>) is idempotent even if a stale table lingers.
         con.execute(
-            f"CREATE TABLE {_qi(table)} AS "
+            f"CREATE OR REPLACE TABLE {_qi(table)} AS "
             f"SELECT * FROM read_csv_auto(?, header=true, ignore_errors=true, "
             f"null_padding=true, sample_size=-1){limit}",
             [path],
@@ -287,9 +350,11 @@ def _build_table_locked(table: str, path: str, row_cap: Optional[int]) -> tuple[
     return columns, int(row_count)
 
 
-def _create_dataset(path: str, name: str, source: str, row_cap: Optional[int] = None,
+def _create_dataset(path: str, name: str, source: str, user_id: str,
+                    row_cap: Optional[int] = None,
                     source_url: Optional[str] = None) -> Dataset:
-    """Load a CSV file at ``path`` into a fresh isolated table and register it.
+    """Load a CSV file at ``path`` into a fresh isolated table, register it, and
+    persist its metadata (owned by ``user_id``) so it survives restarts.
 
     Raises HTTPException(400) with a friendly message on anything DuckDB can't
     parse (non-CSV, malformed, no header, empty). Caller is responsible for the
@@ -302,12 +367,14 @@ def _create_dataset(path: str, name: str, source: str, row_cap: Optional[int] = 
     with _lock:
         columns, row_count = _build_table_locked(table, path, row_cap)
         ds = Dataset(
-            id=dataset_id, table=table, columns=columns,
-            row_count=row_count, source=source, name=name, source_url=source_url,
+            id=dataset_id, table=table, columns=columns, row_count=row_count,
+            source=source, name=name, user_id=user_id, source_url=source_url,
         )
         _registry[dataset_id] = ds
         _evict_locked()
-        return ds
+    db.save_dataset(dataset_id, user_id, name, source, source_url, columns,
+                    row_count, ds.created_at)
+    return ds
 
 
 def _cursor() -> duckdb.DuckDBPyConnection:
@@ -551,7 +618,8 @@ def _name_from_url(url: str) -> str:
 
 
 @app.post("/datasets")
-async def upload_dataset(file: UploadFile = File(...)) -> dict[str, Any]:
+async def upload_dataset(file: UploadFile = File(...),
+                         user: str = Depends(require_user)) -> dict[str, Any]:
     """Receive a CSV or Excel upload, load it into an isolated table, return id + schema."""
     filename = file.filename or "upload.csv"
     lower = filename.lower()
@@ -592,7 +660,7 @@ async def upload_dataset(file: UploadFile = File(...)) -> dict[str, Any]:
         else:
             load_path = tmp.name
 
-        ds = _create_dataset(load_path, name=filename, source="upload")
+        ds = _create_dataset(load_path, name=filename, source="upload", user_id=user)
         return ds.public()
     finally:
         for path in cleanup:
@@ -608,7 +676,7 @@ class PasteRequest(BaseModel):
 
 
 @app.post("/datasets/text")
-def upload_text(req: PasteRequest) -> dict[str, Any]:
+def upload_text(req: PasteRequest, user: str = Depends(require_user)) -> dict[str, Any]:
     """Load pasted CSV / tab-separated text, exactly like an uploaded file.
 
     DuckDB's CSV reader auto-detects the delimiter, so spreadsheet copy-paste
@@ -628,7 +696,7 @@ def upload_text(req: PasteRequest) -> dict[str, Any]:
     try:
         tmp.write(data)
         tmp.close()
-        ds = _create_dataset(tmp.name, name=(req.name or "Pasted data"), source="paste")
+        ds = _create_dataset(tmp.name, name=(req.name or "Pasted data"), source="paste", user_id=user)
         return ds.public()
     finally:
         try:
@@ -643,7 +711,7 @@ class UrlRequest(BaseModel):
 
 
 @app.post("/datasets/url")
-def create_url_dataset(req: UrlRequest) -> dict[str, Any]:
+def create_url_dataset(req: UrlRequest, user: str = Depends(require_user)) -> dict[str, Any]:
     """Load a public CSV URL (e.g. a Google Sheet published to the web as CSV).
 
     The URL is fetched server-side through the same parsing/schema-detection path
@@ -655,7 +723,7 @@ def create_url_dataset(req: UrlRequest) -> dict[str, Any]:
     path = _fetch_csv_url(url)
     try:
         ds = _create_dataset(path, name=(req.name or _name_from_url(url)),
-                             source="url", source_url=url)
+                             source="url", user_id=user, source_url=url)
         return ds.public()
     finally:
         try:
@@ -665,14 +733,14 @@ def create_url_dataset(req: UrlRequest) -> dict[str, Any]:
 
 
 @app.post("/datasets/{dataset_id}/refresh")
-def refresh_dataset(dataset_id: str) -> dict[str, Any]:
+def refresh_dataset(dataset_id: str, user: str = Depends(require_user)) -> dict[str, Any]:
     """Re-fetch a URL-backed dataset's source and replace its data in place.
 
     Keeps the same dataset id (so the open view/filters stay valid). The new data
     is loaded into a temp table first; the live table is only swapped out once the
     fetch and parse succeed, so a failed refresh leaves the existing data intact.
     """
-    ds = _get_dataset(dataset_id)
+    ds = _get_dataset(dataset_id, user)
     if ds.source != "url" or not ds.source_url:
         raise HTTPException(
             status_code=400,
@@ -690,6 +758,8 @@ def refresh_dataset(dataset_id: str) -> dict[str, Any]:
             ds.columns = columns
             ds.row_count = row_count
             ds.last_access = time.time()
+        db.save_dataset(ds.id, ds.user_id, ds.name, ds.source, ds.source_url,
+                        ds.columns, ds.row_count, ds.created_at)
         return ds.public()
     finally:
         try:
@@ -699,7 +769,7 @@ def refresh_dataset(dataset_id: str) -> dict[str, Any]:
 
 
 @app.post("/datasets/sample")
-def create_sample_dataset() -> dict[str, Any]:
+def create_sample_dataset(user: str = Depends(require_user)) -> dict[str, Any]:
     """Load the bundled demo dataset so first-time visitors see it work instantly."""
     if not os.path.exists(SAMPLE_FILE_PATH):
         raise HTTPException(
@@ -708,15 +778,30 @@ def create_sample_dataset() -> dict[str, Any]:
                    f"({SAMPLE_FILE_PATH!r} not found).",
         )
     ds = _create_dataset(
-        SAMPLE_FILE_PATH, name="Sample data", source="sample", row_cap=SAMPLE_ROW_CAP
+        SAMPLE_FILE_PATH, name="Sample data", source="sample", user_id=user,
+        row_cap=SAMPLE_ROW_CAP,
     )
     return ds.public()
 
 
+@app.get("/datasets")
+def list_datasets(user: str = Depends(require_user)) -> dict[str, Any]:
+    """List the signed-in user's datasets (from the persistent store)."""
+    items = [
+        {
+            "dataset_id": d["id"], "name": d["name"], "source": d["source"],
+            "source_url": d["source_url"], "row_count": d["row_count"],
+            "columns": d["schema"], "created_at": d["created_at"],
+        }
+        for d in db.list_datasets(user)
+    ]
+    return {"datasets": items}
+
+
 @app.get("/datasets/{dataset_id}/summary")
-def dataset_summary(dataset_id: str) -> dict[str, Any]:
+def dataset_summary(dataset_id: str, user: str = Depends(require_user)) -> dict[str, Any]:
     """Row/column counts plus per-column basic stats (adapts to column types)."""
-    ds = _get_dataset(dataset_id)
+    ds = _get_dataset(dataset_id, user)
     cur = _cursor()
 
     # One scan computes every column's stats. Build the SELECT list and remember
@@ -762,9 +847,10 @@ def dataset_query(
     sort_by: Optional[str] = None,
     sort_order: str = Query("asc"),
     filters: Optional[str] = None,
+    user: str = Depends(require_user),
 ) -> dict[str, Any]:
     """Paginated, sortable, filterable rows over the uploaded dataset."""
-    ds = _get_dataset(dataset_id)
+    ds = _get_dataset(dataset_id, user)
     cur = _cursor()
 
     where, params = _build_where(ds, filters)
@@ -815,9 +901,10 @@ def dataset_export(
     sort_by: Optional[str] = None,
     sort_order: str = Query("asc"),
     filters: Optional[str] = None,
+    user: str = Depends(require_user),
 ) -> StreamingResponse:
     """Stream the current filtered + sorted view as CSV."""
-    ds = _get_dataset(dataset_id)
+    ds = _get_dataset(dataset_id, user)
     where, params = _build_where(ds, filters)
     order = _order_clause(ds, sort_by, sort_order)
     sql = f"SELECT * FROM {_qi(ds.table)}{where}{order}"
@@ -847,9 +934,10 @@ def dataset_chart(
     interval: Optional[str] = None,
     split_by: Optional[str] = Query(None, description="Category column: one time-series line per value."),
     filters: Optional[str] = None,
+    user: str = Depends(require_user),
 ) -> dict[str, Any]:
     """Aggregated data shaped for charting; adapts to the chosen column's type."""
-    ds = _get_dataset(dataset_id)
+    ds = _get_dataset(dataset_id, user)
     cur = _cursor()
     if column not in ds.column_names:
         raise HTTPException(status_code=400, detail=f"Unknown column {column!r}.")
@@ -1011,6 +1099,7 @@ def dataset_compare(
     dimension_column: Optional[str] = None,
     interval: Optional[str] = None,
     filters: Optional[str] = None,
+    user: str = Depends(require_user),
 ) -> dict[str, Any]:
     """Compact aggregate snapshot for Compare Mode.
 
@@ -1018,7 +1107,7 @@ def dataset_compare(
     Keeping the heavy aggregation in DuckDB avoids shipping large row payloads to
     the browser while preserving the existing upload/table/chart endpoints.
     """
-    ds = _get_dataset(dataset_id)
+    ds = _get_dataset(dataset_id, user)
     cur = _cursor()
     metric_expr = _compare_metric_expr(ds, agg, metric_column)
     where, params = _build_where(ds, filters)
@@ -1087,6 +1176,7 @@ def dataset_insights(
     dataset_id: str,
     mode: str = Query("analyst", description="student | analyst | founder | manager | researcher"),
     filters: Optional[str] = None,
+    user: str = Depends(require_user),
 ) -> dict[str, Any]:
     """Compute the Evidence-Mode report: every insight is backed by real math,
     exact numbers and the actual row ids that prove it (see insights.py).
@@ -1095,7 +1185,7 @@ def dataset_insights(
     also wrap the call here so a truly unexpected failure still returns HTTP 200
     with a valid, honest report instead of a 500/503 that blanks the Evidence tab.
     """
-    ds = _get_dataset(dataset_id)
+    ds = _get_dataset(dataset_id, user)
     where, params = _build_where(ds, filters)
     if con is None:
         raise HTTPException(status_code=503, detail="Server not ready.")
@@ -1136,10 +1226,11 @@ def dataset_rows(
     dataset_id: str,
     rowids: str = Query(..., description="Comma-separated DuckDB rowids to fetch"),
     filters: Optional[str] = None,
+    user: str = Depends(require_user),
 ) -> dict[str, Any]:
     """Return the full data for specific rowids so the evidence drawer can show
     the exact rows behind a claim. Ids are bound, never interpolated."""
-    ds = _get_dataset(dataset_id)
+    ds = _get_dataset(dataset_id, user)
     cur = _cursor()
     try:
         ids = [int(x) for x in rowids.split(",") if x.strip() != ""][:200]
@@ -1177,46 +1268,39 @@ _TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
 @app.post("/reports")
-def create_report(body: ReportSubmission) -> dict[str, Any]:
-    """Store a computed Evidence-Mode report under a uuid token and return a
-    read-only URL. Persistence is best-effort (see REPORTS_DIR note)."""
+def create_report(body: ReportSubmission, user: str = Depends(require_user)) -> dict[str, Any]:
+    """Store a computed Evidence-Mode report (owned by the signed-in user) and
+    return a token. Reports persist in the database and are private per user."""
     payload = {
         "report": body.report,
         "dataset_name": body.dataset_name,
         "created_at": time.time(),
     }
-    encoded = json.dumps(payload).encode("utf-8")
-    if len(encoded) > MAX_REPORT_BYTES:
+    if len(json.dumps(payload).encode("utf-8")) > MAX_REPORT_BYTES:
         raise HTTPException(status_code=413, detail="Report is too large to share.")
 
     token = uuid.uuid4().hex
     try:
-        os.makedirs(REPORTS_DIR, exist_ok=True)
-        with open(os.path.join(REPORTS_DIR, f"{token}.json"), "wb") as fh:
-            fh.write(encoded)
-    except OSError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="Could not save the report on this server (storage is ephemeral "
-                   "on the free tier). Please try again.",
-        ) from exc
+        db.save_report(token, user, payload)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail="Could not save the report. Please try again.") from exc
     return {"token": token, "url": f"/report/{token}"}
 
 
 @app.get("/reports/{token}")
-def get_report(token: str) -> dict[str, Any]:
-    """Return a previously stored report by token (read-only)."""
-    if not _TOKEN_RE.match(token):  # tokens are uuid4 hex -> no path traversal
+def get_report(token: str, user: str = Depends(require_user)) -> dict[str, Any]:
+    """Return one of the signed-in user's stored reports by token.
+
+    404 if unknown, 403 if it belongs to another user.
+    """
+    if not _TOKEN_RE.match(token):  # tokens are uuid4 hex -> no injection
         raise HTTPException(status_code=400, detail="Invalid report token.")
-    path = os.path.join(REPORTS_DIR, f"{token}.json")
-    if not os.path.exists(path):
-        raise HTTPException(
-            status_code=404,
-            detail="This shared report was not found. Links are best-effort and may "
-                   "expire when the free-tier server restarts.",
-        )
-    with open(path, "rb") as fh:
-        return json.loads(fh.read())
+    row = db.get_report(token)
+    if row is None:
+        raise HTTPException(status_code=404, detail="This report was not found.")
+    if row["user_id"] != user:
+        raise HTTPException(status_code=403, detail="You don't have access to this report.")
+    return row["payload"]
 
 
 if __name__ == "__main__":

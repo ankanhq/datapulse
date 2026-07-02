@@ -6,3 +6,7 @@ pandas>=2.0
 python-multipart>=0.0.9
 openpyxl>=3.1
 xlrd>=2.0
+# Auth (Supabase JWT verification) + persistent Postgres.
+pyjwt>=2.8
+cryptography>=42.0
+psycopg[binary]>=3.1
