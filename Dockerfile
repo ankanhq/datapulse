@@ -6,10 +6,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# App code. NOTE: keep this in sync with the modules main.py imports — insights.py
-# powers Evidence Mode and main.py imports it at startup, so it MUST be copied in
-# (otherwise the container crashes on boot with ModuleNotFoundError: insights).
-COPY main.py insights.py generate_data.py ./
+# App code. NOTE: keep this in sync with the modules main.py imports — it imports
+# insights (Evidence Mode), auth (Supabase token verification) and db (persistent
+# metadata store) at startup, so ALL must be copied in or the container crashes on
+# boot with ModuleNotFoundError.
+COPY main.py insights.py auth.py db.py generate_data.py ./
 
 # Build the "story" sample at image build time so the image is self-contained
 # and "Try with sample data" shows a clear, high-confidence Evidence Mode story
