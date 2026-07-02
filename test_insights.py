@@ -399,6 +399,110 @@ def test_chart_time_series_without_split_is_unchanged(tmp_path):
     assert all({"time", "value"} <= set(pt) for pt in body["data"])
 
 
+import contextlib
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+@contextlib.contextmanager
+def _csv_server(state):
+    """A tiny localhost HTTP server serving CSV from a mutable ``state`` dict
+    ({"body": str, "ctype": str}), so tests can exercise fetch + refresh."""
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = state["body"].encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", state.get("ctype", "text/csv"))
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):  # keep test output quiet
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        yield f"http://127.0.0.1:{srv.server_address[1]}/data.csv"
+    finally:
+        srv.shutdown()
+
+
+def test_url_dataset_loads_refreshes_and_supports_evidence(monkeypatch):
+    # The local test server is on loopback, which the SSRF guard blocks by design;
+    # neutralise just that check so we can exercise the real fetch/parse/refresh.
+    monkeypatch.setattr(main, "_reject_if_private", lambda host: None)
+
+    v1 = "date,product,region,units,revenue\n" + "\n".join(
+        f"2025-01-{1 + i % 28:02d},Widget,North,{i + 1},{(i + 1) * 10}" for i in range(40)
+    )
+    state = {"body": v1, "ctype": "text/csv"}
+    with _csv_server(state) as url:
+        r = client.post("/datasets/url", json={"url": url, "name": "Google Sheet"})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        ds = body["dataset_id"]
+        assert body["source"] == "url"
+        assert body["source_url"] == url
+        assert body["row_count"] == 40
+        assert {c["name"] for c in body["columns"]} == {"date", "product", "region", "units", "revenue"}
+
+        # Evidence Mode works on a URL-backed dataset.
+        assert client.get(f"/datasets/{ds}/insights").status_code == 200
+
+        # Refresh re-pulls the latest data in place (same id, new row count).
+        state["body"] = v1 + "\n" + "\n".join(
+            f"2025-02-{1 + i % 28:02d},Gadget,South,{i + 1},{(i + 1) * 20}" for i in range(20)
+        )
+        r2 = client.post(f"/datasets/{ds}/refresh")
+        assert r2.status_code == 200, r2.text
+        assert r2.json()["dataset_id"] == ds
+        assert r2.json()["row_count"] == 60
+
+
+def test_url_rejects_private_address():
+    # Loopback must be refused by the SSRF guard (no monkeypatch here).
+    r = client.post("/datasets/url", json={"url": "http://127.0.0.1:9/x.csv"})
+    assert r.status_code == 400
+    assert "private" in r.json()["detail"].lower() or "local" in r.json()["detail"].lower()
+
+
+def test_url_rejects_non_http_scheme():
+    r = client.post("/datasets/url", json={"url": "file:///etc/passwd"})
+    assert r.status_code == 400
+
+
+def test_url_rejects_html_response(monkeypatch):
+    monkeypatch.setattr(main, "_reject_if_private", lambda host: None)
+    state = {"body": "<html><body>not csv</body></html>", "ctype": "text/html"}
+    with _csv_server(state) as url:
+        r = client.post("/datasets/url", json={"url": url})
+        assert r.status_code == 400
+        assert "csv" in r.json()["detail"].lower()
+
+
+def test_refresh_rejects_non_url_dataset():
+    ds = _paste("a,b\n1,2\n3,4\n")
+    r = client.post(f"/datasets/{ds}/refresh")
+    assert r.status_code == 400
+
+
+def test_ssrf_guard_unwraps_nat64(monkeypatch):
+    # On NAT64/IPv6-only networks a public IPv4 host resolves to a 64:ff9b::/96
+    # address; the guard must unwrap it and allow the (public) embedded IPv4,
+    # while still blocking a private IPv4 reached via NAT64.
+    def fake_getaddrinfo(v6):
+        return lambda *a, **k: [(10, 1, 6, "", (v6, 0, 0, 0))]
+
+    monkeypatch.setattr(main.socket, "getaddrinfo", fake_getaddrinfo("64:ff9b::808:808"))  # 8.8.8.8
+    main._reject_if_private("public.example")  # must not raise
+
+    monkeypatch.setattr(main.socket, "getaddrinfo", fake_getaddrinfo("64:ff9b::a00:5"))  # 10.0.0.5
+    with pytest.raises(Exception):
+        main._reject_if_private("internal.example")
+
+
 def test_share_report_roundtrip():
     ds = _paste(_synthetic_csv())
     rep = client.get(f"/datasets/{ds}/insights").json()

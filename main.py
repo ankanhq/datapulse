@@ -15,17 +15,22 @@ from __future__ import annotations
 
 import csv
 import io
+import ipaddress
 import json
 import os
 import re
+import socket
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Iterator, Optional
+from urllib.parse import urlparse
 
 import duckdb
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
@@ -103,8 +108,9 @@ class Dataset:
     table: str
     columns: list[dict[str, str]]   # [{name, type, sql_type}]
     row_count: int
-    source: str                     # "upload" | "sample"
+    source: str                     # "upload" | "paste" | "sample" | "url"
     name: str
+    source_url: Optional[str] = None  # set when source == "url" (re-fetchable)
     created_at: float = field(default_factory=time.time)
     last_access: float = field(default_factory=time.time)
 
@@ -124,6 +130,7 @@ class Dataset:
             "dataset_id": self.id,
             "name": self.name,
             "source": self.source,
+            "source_url": self.source_url,
             "row_count": self.row_count,
             "columns": self.columns,
         }
@@ -232,7 +239,56 @@ def _get_dataset(dataset_id: str) -> Dataset:
         return ds
 
 
-def _create_dataset(path: str, name: str, source: str, row_cap: Optional[int] = None) -> Dataset:
+def _build_table_locked(table: str, path: str, row_cap: Optional[int]) -> tuple[list[dict], int]:
+    """Load the CSV at ``path`` into ``table`` and validate the parsed shape.
+
+    Assumes ``_lock`` is held. Returns ``(columns, row_count)`` or raises
+    HTTPException(400) with a friendly message, dropping the table on failure.
+    """
+    assert con is not None
+    limit = f" LIMIT {int(row_cap)}" if row_cap else ""
+    try:
+        # Tolerant read: skip bad lines and pad ragged rows rather than
+        # crashing, but still surface a clean error if nothing usable comes
+        # out. sample_size=-1 scans the whole (<=25MB) file for type detection.
+        con.execute(
+            f"CREATE TABLE {_qi(table)} AS "
+            f"SELECT * FROM read_csv_auto(?, header=true, ignore_errors=true, "
+            f"null_padding=true, sample_size=-1){limit}",
+            [path],
+        )
+    except Exception as exc:  # noqa: BLE001 - any parse failure -> friendly 400
+        con.execute(f"DROP TABLE IF EXISTS {_qi(table)}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not read this file as CSV. {str(exc).splitlines()[0]}",
+        ) from exc
+
+    info = con.execute(f"PRAGMA table_info({_qi(table)})").fetchall()
+    # PRAGMA table_info -> (cid, name, type, notnull, dflt_value, pk)
+    columns = [
+        {"name": r[1], "type": _classify(r[2]), "sql_type": r[2]}
+        for r in info
+    ]
+    row_count = con.execute(f"SELECT COUNT(*) FROM {_qi(table)}").fetchone()[0]
+
+    # Validation that needs the parsed shape.
+    problem: Optional[str] = None
+    if not columns:
+        problem = "No columns were detected in the file."
+    elif row_count == 0:
+        problem = "The file has no data rows. Make sure the first row is a header and there is at least one data row below it."
+    elif all(c["name"].startswith("column") and c["name"][6:].isdigit() for c in columns):
+        problem = "No header row was detected. Please include column names in the first row of the CSV."
+    if problem:
+        con.execute(f"DROP TABLE IF EXISTS {_qi(table)}")
+        raise HTTPException(status_code=400, detail=problem)
+
+    return columns, int(row_count)
+
+
+def _create_dataset(path: str, name: str, source: str, row_cap: Optional[int] = None,
+                    source_url: Optional[str] = None) -> Dataset:
     """Load a CSV file at ``path`` into a fresh isolated table and register it.
 
     Raises HTTPException(400) with a friendly message on anything DuckDB can't
@@ -242,49 +298,12 @@ def _create_dataset(path: str, name: str, source: str, row_cap: Optional[int] = 
     assert con is not None
     dataset_id = uuid.uuid4().hex
     table = f"ds_{dataset_id}"  # hex-only -> always a safe identifier
-    limit = f" LIMIT {int(row_cap)}" if row_cap else ""
 
     with _lock:
-        try:
-            # Tolerant read: skip bad lines and pad ragged rows rather than
-            # crashing, but still surface a clean error if nothing usable comes
-            # out. sample_size=-1 scans the whole (<=25MB) file for type detection.
-            con.execute(
-                f"CREATE TABLE {_qi(table)} AS "
-                f"SELECT * FROM read_csv_auto(?, header=true, ignore_errors=true, "
-                f"null_padding=true, sample_size=-1){limit}",
-                [path],
-            )
-        except Exception as exc:  # noqa: BLE001 - any parse failure -> friendly 400
-            con.execute(f"DROP TABLE IF EXISTS {_qi(table)}")
-            raise HTTPException(
-                status_code=400,
-                detail=f"Could not read this file as CSV. {str(exc).splitlines()[0]}",
-            ) from exc
-
-        info = con.execute(f"PRAGMA table_info({_qi(table)})").fetchall()
-        # PRAGMA table_info -> (cid, name, type, notnull, dflt_value, pk)
-        columns = [
-            {"name": r[1], "type": _classify(r[2]), "sql_type": r[2]}
-            for r in info
-        ]
-        row_count = con.execute(f"SELECT COUNT(*) FROM {_qi(table)}").fetchone()[0]
-
-        # Validation that needs the parsed shape.
-        problem: Optional[str] = None
-        if not columns:
-            problem = "No columns were detected in the file."
-        elif row_count == 0:
-            problem = "The file has no data rows. Make sure the first row is a header and there is at least one data row below it."
-        elif all(c["name"].startswith("column") and c["name"][6:].isdigit() for c in columns):
-            problem = "No header row was detected. Please include column names in the first row of the CSV."
-        if problem:
-            con.execute(f"DROP TABLE IF EXISTS {_qi(table)}")
-            raise HTTPException(status_code=400, detail=problem)
-
+        columns, row_count = _build_table_locked(table, path, row_cap)
         ds = Dataset(
             id=dataset_id, table=table, columns=columns,
-            row_count=int(row_count), source=source, name=name,
+            row_count=row_count, source=source, name=name, source_url=source_url,
         )
         _registry[dataset_id] = ds
         _evict_locked()
@@ -399,6 +418,138 @@ def _excel_to_csv(src_path: str) -> str:
     return csv_tmp.name
 
 
+# ---------------------------------------------------------------------------
+# Fetching a CSV from a public URL (e.g. a Google Sheet "Publish to web" link).
+# ---------------------------------------------------------------------------
+
+URL_FETCH_TIMEOUT = int(os.getenv("DATAPULSE_URL_FETCH_TIMEOUT", "20"))  # seconds
+
+
+_NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
+
+
+def _reject_if_private(host: str) -> None:
+    """Resolve ``host`` and refuse private/loopback/link-local/reserved targets.
+
+    This is the core SSRF guard: it stops a user-supplied URL from being used to
+    reach the server's own network (e.g. cloud metadata at 169.254.169.254).
+
+    NAT64 and IPv4-mapped IPv6 addresses are unwrapped to the real IPv4 they point
+    at before the check, so a public IPv4 host reached over IPv6 (common on
+    IPv6-only / NAT64 networks) isn't mis-flagged as "reserved" and blocked.
+    """
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as exc:
+        raise HTTPException(status_code=400, detail=f"Could not resolve the host {host!r}.") from exc
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if isinstance(ip, ipaddress.IPv6Address):
+            if ip.ipv4_mapped:
+                ip = ip.ipv4_mapped
+            elif ip in _NAT64_PREFIX:
+                ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+        if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+                or ip.is_multicast or ip.is_unspecified):
+            raise HTTPException(
+                status_code=400,
+                detail="That URL resolves to a private or local address, which isn't allowed.",
+            )
+
+
+def _validate_public_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(status_code=400, detail="The link must start with http:// or https://.")
+    if not parsed.hostname:
+        raise HTTPException(status_code=400, detail="That doesn't look like a valid URL.")
+    _reject_if_private(parsed.hostname)
+
+
+class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow redirects, but re-validate every hop so a redirect can't be used to
+    reach a private/internal address after the initial check passed."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validate_public_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _fetch_csv_url(url: str) -> str:
+    """Fetch a public CSV URL server-side into a size-capped temp .csv file.
+
+    Validates the target is public (http/https, not a private address) at every
+    redirect hop and rejects obvious non-CSV (HTML) responses. Returns the temp
+    path; the caller must delete it.
+    """
+    url = url.strip()
+    _validate_public_url(url)
+    opener = urllib.request.build_opener(_ValidatingRedirectHandler)
+    req = urllib.request.Request(url, headers={"User-Agent": "DataPulse/1.0 (+csv-fetch)"})
+    try:
+        resp = opener.open(req, timeout=URL_FETCH_TIMEOUT)
+    except HTTPException:
+        raise  # a redirect hop failed validation
+    except urllib.error.HTTPError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"The link returned an error (HTTP {exc.code}). Make sure the sheet is "
+                   "published to the web and publicly accessible.",
+        ) from exc
+    except (urllib.error.URLError, socket.timeout, TimeoutError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not fetch that link. Check the URL is correct and reachable.",
+        ) from exc
+
+    ctype = (resp.headers.get("Content-Type") or "").lower()
+    if "text/html" in ctype:
+        resp.close()
+        raise HTTPException(
+            status_code=400,
+            detail="That link returned a web page, not CSV. In Google Sheets use "
+                   "File → Share → Publish to web → CSV, then paste that link.",
+        )
+
+    tmp = tempfile.NamedTemporaryFile(prefix="datapulse_url_", suffix=".csv", delete=False)
+    size = 0
+    try:
+        while True:
+            chunk = resp.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_UPLOAD_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"The linked file is too large. The limit is "
+                           f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
+                )
+            tmp.write(chunk)
+        tmp.close()
+        if size == 0:
+            raise HTTPException(status_code=400, detail="The linked file is empty.")
+        return tmp.name
+    except BaseException:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+        raise
+    finally:
+        resp.close()
+
+
+def _name_from_url(url: str) -> str:
+    """A friendly default dataset name derived from the URL, else a generic label."""
+    try:
+        base = os.path.basename(urlparse(url).path)
+        if base and "." in base:
+            return base
+    except Exception:  # noqa: BLE001
+        pass
+    return "Linked CSV"
+
+
 @app.post("/datasets")
 async def upload_dataset(file: UploadFile = File(...)) -> dict[str, Any]:
     """Receive a CSV or Excel upload, load it into an isolated table, return id + schema."""
@@ -482,6 +633,67 @@ def upload_text(req: PasteRequest) -> dict[str, Any]:
     finally:
         try:
             os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
+class UrlRequest(BaseModel):
+    url: str
+    name: Optional[str] = None
+
+
+@app.post("/datasets/url")
+def create_url_dataset(req: UrlRequest) -> dict[str, Any]:
+    """Load a public CSV URL (e.g. a Google Sheet published to the web as CSV).
+
+    The URL is fetched server-side through the same parsing/schema-detection path
+    as an upload, and stored on the dataset so it can be re-fetched via /refresh.
+    """
+    if not req.url or not req.url.strip():
+        raise HTTPException(status_code=400, detail="Please provide a CSV link.")
+    url = req.url.strip()
+    path = _fetch_csv_url(url)
+    try:
+        ds = _create_dataset(path, name=(req.name or _name_from_url(url)),
+                             source="url", source_url=url)
+        return ds.public()
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+@app.post("/datasets/{dataset_id}/refresh")
+def refresh_dataset(dataset_id: str) -> dict[str, Any]:
+    """Re-fetch a URL-backed dataset's source and replace its data in place.
+
+    Keeps the same dataset id (so the open view/filters stay valid). The new data
+    is loaded into a temp table first; the live table is only swapped out once the
+    fetch and parse succeed, so a failed refresh leaves the existing data intact.
+    """
+    ds = _get_dataset(dataset_id)
+    if ds.source != "url" or not ds.source_url:
+        raise HTTPException(
+            status_code=400,
+            detail="This dataset has no source link to refresh. Refresh works on datasets "
+                   "loaded from a CSV link.",
+        )
+    path = _fetch_csv_url(ds.source_url)
+    tmp_table = f"ds_{uuid.uuid4().hex}"
+    try:
+        assert con is not None
+        with _lock:
+            columns, row_count = _build_table_locked(tmp_table, path, None)
+            con.execute(f"DROP TABLE IF EXISTS {_qi(ds.table)}")
+            con.execute(f"ALTER TABLE {_qi(tmp_table)} RENAME TO {_qi(ds.table)}")
+            ds.columns = columns
+            ds.row_count = row_count
+            ds.last_access = time.time()
+        return ds.public()
+    finally:
+        try:
+            os.unlink(path)
         except OSError:
             pass
 

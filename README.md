@@ -117,15 +117,17 @@ All configuration is via environment variables:
 
 ## API
 
-All dataset endpoints are scoped to a `dataset_id` returned by one of the three
-load endpoints.
+All dataset endpoints are scoped to a `dataset_id` returned by one of the load
+endpoints (`/datasets`, `/datasets/text`, `/datasets/url`, `/datasets/sample`).
 
 | Method | Path                          | Purpose                                                        |
 |--------|-------------------------------|----------------------------------------------------------------|
 | GET    | `/`                           | Health check (`active_datasets` count).                        |
 | POST   | `/datasets`                   | Upload a CSV/TSV or Excel (`.xlsx`/`.xls`) file (multipart).    |
 | POST   | `/datasets/text`              | Analyze pasted CSV / tab-separated text (`{ text, name }`).     |
+| POST   | `/datasets/url`               | Load a public CSV URL (`{ url, name }`) — e.g. a Google Sheet published to the web as CSV. |
 | POST   | `/datasets/sample`            | Load the bundled sample dataset.                               |
+| POST   | `/datasets/{id}/refresh`      | Re-fetch a URL-backed dataset's source and replace its data in place. |
 | GET    | `/datasets/{id}/summary`      | Row/column counts and per-column stats.                        |
 | GET    | `/datasets/{id}/query`        | Paginated, sortable, filterable rows.                          |
 | GET    | `/datasets/{id}/export`       | Stream the filtered + sorted view as CSV.                      |
@@ -146,9 +148,22 @@ The Evidence Mode endpoints:
 All insights are computed with **DuckDB + numpy** — no external AI service, and no
 API keys.
 
-Each load endpoint returns `{ dataset_id, name, source, row_count, columns }`,
+Each load endpoint returns `{ dataset_id, name, source, source_url, row_count, columns }`,
 where `columns` is `[{ name, type, sql_type }]` and `type` is one of
-`number` / `date` / `text`.
+`number` / `date` / `text`. `source` is `upload` / `paste` / `sample` / `url`, and
+`source_url` is set only for `url` datasets (so they can be refreshed).
+
+### Connecting a Google Sheet (or any public CSV URL)
+
+`POST /datasets/url` fetches a public CSV **server-side** and loads it through the
+exact same parsing/schema-detection path as an upload; the URL is stored so
+`POST /datasets/{id}/refresh` can re-pull the latest data in place. In Google
+Sheets: **File → Share → Publish to web → CSV**, then send that link. A
+published-to-web link is **public**, so this is for personal / non-confidential
+sheets only. The fetch is guarded against SSRF: only `http`/`https`, redirects are
+re-validated at every hop, and URLs resolving to private/loopback/link-local
+addresses (including via NAT64 / IPv4-mapped IPv6) are refused; responses are
+size-capped like uploads.
 
 ### Query parameters
 
