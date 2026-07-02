@@ -114,6 +114,28 @@ All configuration is via environment variables:
 | `DATAPULSE_DATASET_TTL`   | `1800`                                          | Seconds before an idle dataset is evicted.           |
 | `DATAPULSE_SAMPLE_ROWS`   | `50000`                                         | Row cap when loading the sample.                     |
 | `PORT`                    | `8000`                                          | Bind port (Render injects this).                     |
+| `SUPABASE_URL`            | _(required for auth)_                           | Supabase project URL (used for JWKS + userinfo).     |
+| `SUPABASE_JWT_SECRET`     | _(optional)_                                    | Legacy HS256 secret, accepted as a fallback.         |
+| `SUPABASE_SERVICE_ROLE_KEY` | _(optional)_                                  | Service-role key for the `/auth/v1/user` fallback.   |
+| `DATABASE_URL`            | `sqlite:///./datapulse.db`                      | Postgres URL for the metadata store (Supabase in prod). |
+
+### Accounts & database (Supabase)
+
+Every `/datasets` and `/reports` endpoint requires a valid Supabase access token
+(`Authorization: Bearer <token>`) and is scoped to the token's user (`sub`);
+requests without a valid token get **401**, and one user's data is never visible
+to another (**403**). Tokens are verified against the project **JWKS** (the new
+asymmetric ES256/RS256 signing keys), with the legacy **HS256** secret and the
+`GET /auth/v1/user` endpoint as fallbacks — set whichever of `SUPABASE_JWT_SECRET`
+/ `SUPABASE_SERVICE_ROLE_KEY` your project uses.
+
+Dataset metadata (id, name, source, source URL, schema, row count, `user_id`) and
+saved reports persist in the Supabase **Postgres** given by `DATABASE_URL` (host it
+in an EU region; Supabase encrypts data at rest). The analysis engine still runs
+on in-memory DuckDB — persisting the source URL lets URL-backed datasets be
+reloaded and refreshed per user after a restart. With no `DATABASE_URL` set it
+falls back to a local SQLite file for dev/CI. **Do not commit any keys** — set
+these as environment variables on the host.
 
 ## API
 
