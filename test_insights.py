@@ -337,6 +337,31 @@ def test_endpoint_returns_200_even_if_a_section_raises(monkeypatch):
     assert corr and corr[0]["is_limitation"] is True
 
 
+def test_story_sample_shows_strong_evidence_cards(tmp_path):
+    # The built-in "story" sample must produce strong cards on first click:
+    # a confident volume trend, a dominant category, and one obvious outlier.
+    import generate_data
+
+    p = tmp_path / "story.csv"
+    generate_data.generate_story(str(p), days=180, seed=7)
+    ds = _paste(p.read_text(), name="story")
+    rep = client.get(f"/datasets/{ds}/insights").json()
+
+    real = [i for i in rep["insights"] if not i.get("is_limitation")]
+    hidden = [i for i in real if i["category"] == "hidden_patterns"]
+    anomalies = [i for i in real if i["category"] == "anomalies"]
+
+    trend = [i for i in hidden if "over time" in i["title"]]
+    assert trend and trend[0]["confidence"] >= 0.7, "expected a confident trend card"
+
+    concentration = [i for i in hidden if "dominates" in i["title"]]
+    assert concentration and concentration[0]["confidence"] >= 0.4, "expected a dominant-category card"
+
+    outlier = [i for i in anomalies if "outlier" in i["title"] and "revenue" in i["title"]]
+    assert outlier, "expected an outlier card on revenue"
+    assert outlier[0]["supporting_metrics"]["outlier_count"] == 1, "expected exactly one obvious outlier"
+
+
 def test_share_report_roundtrip():
     ds = _paste(_synthetic_csv())
     rep = client.get(f"/datasets/{ds}/insights").json()

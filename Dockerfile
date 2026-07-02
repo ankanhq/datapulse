@@ -11,14 +11,15 @@ RUN pip install --no-cache-dir -r requirements.txt
 # (otherwise the container crashes on boot with ModuleNotFoundError: insights).
 COPY main.py insights.py generate_data.py ./
 
-# Generate the smaller 100k-row production dataset at build time, so the image
-# is self-contained and no large data file needs to be committed or uploaded.
-RUN python generate_data.py --rows 100000 --out data_100k.csv
+# Build the "story" sample at image build time so the image is self-contained
+# and "Try with sample data" shows a clear, high-confidence Evidence Mode story
+# on first click (a rising trend, one obvious outlier, a dominant category).
+RUN python generate_data.py --profile story --out data_sample.csv
 
-# Point the API at the production dataset. The CORS origins are intentionally
+# Point the API at the sample dataset. The CORS origins are intentionally
 # left unset here so the image isn't tied to a specific frontend URL — set
 # DATAPULSE_CORS_ORIGINS at deploy time to your frontend's URL.
-ENV DATAPULSE_DATA_FILE=./data_100k.csv
+ENV DATAPULSE_DATA_FILE=./data_sample.csv
 
 # Render (and most PaaS) inject $PORT; default to 8000 for local `docker run`.
 ENV PORT=8000

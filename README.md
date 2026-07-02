@@ -70,15 +70,19 @@ pip install -r requirements.txt
 ### Sample data (optional, for the "Try sample data" button)
 
 The sample endpoint loads a local file pointed to by `DATAPULSE_DATA_FILE`.
-Generate one with the included script:
+Generate the built-in "story" sample — a small, business-shaped dataset designed
+so Evidence Mode shows strong cards on first click (a rising trend, one obvious
+outlier, a dominant category):
 
 ```bash
-python generate_data.py --rows 100000 --out data_100k.csv
-export DATAPULSE_DATA_FILE=./data_100k.csv
+python generate_data.py --profile story --out data_sample.csv
+export DATAPULSE_DATA_FILE=./data_sample.csv
 ```
 
-The sample is row-capped on load (`DATAPULSE_SAMPLE_ROWS`, default 50,000) so it
-stays light. Uploading and pasting work without any local data file.
+For a large stress/scale dataset instead, use the default `random` profile
+(e.g. `python generate_data.py --rows 100000 --out data_100k.csv`). The sample is
+row-capped on load (`DATAPULSE_SAMPLE_ROWS`, default 50,000) so it stays light.
+Uploading and pasting work without any local data file.
 
 ## Run
 
