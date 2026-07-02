@@ -362,6 +362,43 @@ def test_story_sample_shows_strong_evidence_cards(tmp_path):
     assert outlier[0]["supporting_metrics"]["outlier_count"] == 1, "expected exactly one obvious outlier"
 
 
+def test_chart_time_series_split_by(tmp_path):
+    # A split-by time series returns one aligned series per category value.
+    import generate_data
+
+    p = tmp_path / "story.csv"
+    generate_data.generate_story(str(p), days=180, seed=7)
+    ds = _paste(p.read_text(), name="story")
+
+    r = client.get(f"/datasets/{ds}/chart", params={
+        "chart_type": "time_series", "column": "date", "agg": "avg",
+        "y_column": "revenue", "split_by": "product_line", "interval": "month",
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["split_by"] == "product_line"
+    assert len(body["labels"]) > 0
+    assert len(body["series"]) >= 2
+    for s in body["series"]:
+        assert "key" in s and len(s["values"]) == len(body["labels"])
+
+
+def test_chart_time_series_without_split_is_unchanged(tmp_path):
+    import generate_data
+
+    p = tmp_path / "story.csv"
+    generate_data.generate_story(str(p), days=120, seed=3)
+    ds = _paste(p.read_text(), name="story")
+
+    r = client.get(f"/datasets/{ds}/chart", params={
+        "chart_type": "time_series", "column": "date", "agg": "count", "interval": "month",
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert "data" in body and "series" not in body
+    assert all({"time", "value"} <= set(pt) for pt in body["data"])
+
+
 def test_share_report_roundtrip():
     ds = _paste(_synthetic_csv())
     rep = client.get(f"/datasets/{ds}/insights").json()

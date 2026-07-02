@@ -71,6 +71,7 @@ MAX_REPORT_BYTES = 4 * 1024 * 1024  # guard against oversized report payloads
 MAX_CHART_BUCKETS = 2_000      # time-series granularity guard
 CATEGORY_TOP_N = 50            # category_counts slices
 HISTOGRAM_BINS = 30            # numeric_histogram bins
+SPLIT_SERIES_TOP_N = 8         # max lines when a time series is split by a category
 EXPORT_BATCH = 50_000          # rows pulled per batch while streaming export
 
 # Filter operators allowed per classified column type.
@@ -344,6 +345,11 @@ def _build_where(ds: Dataset, filters_json: Optional[str]) -> tuple[str, list[An
 
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     return where, params
+
+
+def _augment_where(where: str, extra: str) -> str:
+    """Append a server-built predicate to a WHERE clause from ``_build_where``."""
+    return f"{where} AND {extra}" if where.strip() else f" WHERE {extra}"
 
 
 def _order_clause(ds: Dataset, sort_by: Optional[str], sort_order: str) -> str:
@@ -627,6 +633,7 @@ def dataset_chart(
     y_column: Optional[str] = None,
     agg: str = Query("count", description="count | avg | sum (time_series)"),
     interval: Optional[str] = None,
+    split_by: Optional[str] = Query(None, description="Category column: one time-series line per value."),
     filters: Optional[str] = None,
 ) -> dict[str, Any]:
     """Aggregated data shaped for charting; adapts to the chosen column's type."""
@@ -665,10 +672,51 @@ def dataset_chart(
         span = max((max_ts - min_ts).total_seconds(), 1.0)
         chosen = _pick_interval(span, interval)
 
-        if agg == "count":
-            agg_expr = "COUNT(*)"
-        else:
-            agg_expr = f"{agg.upper()}({_qi(y_column)})"
+        agg_expr = "COUNT(*)" if agg == "count" else f"{agg.upper()}({_qi(y_column)})"
+
+        # Optional "split by": draw one line per value of a category column. We
+        # cap the number of lines to the top-N categories (by row count) so the
+        # chart stays fast and readable regardless of cardinality.
+        if split_by:
+            if split_by not in ds.column_names:
+                raise HTTPException(status_code=400, detail=f"Unknown split_by column {split_by!r}.")
+            if split_by == column:
+                raise HTTPException(status_code=400, detail="split_by must differ from the date column.")
+            scol = _qi(split_by)
+            key_expr = f"COALESCE(CAST({scol} AS VARCHAR), '(blank)')"
+            top = cur.execute(
+                f"SELECT {key_expr} AS k, COUNT(*) c FROM {tbl}{where} "
+                f"GROUP BY k ORDER BY c DESC LIMIT {SPLIT_SERIES_TOP_N}", params
+            ).fetchall()
+            keys = [k for k, _ in top]
+            if not keys:
+                return {"chart_type": chart_type, "column": column, "interval": chosen,
+                        "agg": agg, "y_column": y_column, "split_by": split_by,
+                        "labels": [], "series": []}
+            placeholders = ", ".join("?" for _ in keys)
+            sql = (
+                f"SELECT date_trunc('{chosen}', {col}) AS bucket, {key_expr} AS k, {agg_expr} AS value "
+                f"FROM {tbl}{_augment_where(where, f'{key_expr} IN ({placeholders})')} "
+                f"GROUP BY bucket, k ORDER BY bucket"
+            )
+            rows = cur.execute(sql, [*params, *keys]).fetchall()
+            buckets: list[Any] = []
+            seen: set = set()
+            grid: dict[Any, dict[Any, float]] = {k: {} for k in keys}
+            for bucket, k, v in rows:
+                if bucket not in seen:
+                    seen.add(bucket)
+                    buckets.append(bucket)
+                grid.setdefault(k, {})[bucket] = round(float(v), 4) if v is not None else None
+            labels = [_jsonable(b) for b in buckets]
+            series = [
+                {"key": k, "values": [grid.get(k, {}).get(b) for b in buckets]}
+                for k in keys
+            ]
+            return {"chart_type": chart_type, "column": column, "interval": chosen,
+                    "agg": agg, "y_column": y_column, "split_by": split_by,
+                    "labels": labels, "series": series}
+
         sql = (
             f"SELECT date_trunc('{chosen}', {col}) AS bucket, {agg_expr} AS value "
             f"FROM {tbl}{where} GROUP BY bucket ORDER BY bucket"
