@@ -798,6 +798,29 @@ def list_datasets(user: str = Depends(require_user)) -> dict[str, Any]:
     return {"datasets": items}
 
 
+@app.delete("/account")
+def delete_account(user: str = Depends(require_user)) -> dict[str, Any]:
+    """Permanently delete the signed-in user's data and auth account (GDPR).
+
+    Removes their live in-memory datasets, every persisted dataset/report row they
+    own, and finally the Supabase auth user. ``require_user`` guarantees a caller
+    can only ever delete their OWN account — the user id comes from the verified
+    token, never from the request body.
+    """
+    assert con is not None
+    # 1) Drop any of this user's live in-memory DuckDB tables.
+    with _lock:
+        mine = [k for k, d in _registry.items() if d.user_id == user]
+        for did in mine:
+            con.execute(f"DROP TABLE IF EXISTS {_qi(_registry[did].table)}")
+            del _registry[did]
+    # 2) Remove persisted metadata (datasets + reports) for this user.
+    db.delete_user_data(user)
+    # 3) Remove the auth account itself (best-effort; needs the service-role key).
+    account_removed = auth.delete_auth_user(user)
+    return {"deleted": True, "account_removed": account_removed}
+
+
 @app.get("/datasets/{dataset_id}/summary")
 def dataset_summary(dataset_id: str, user: str = Depends(require_user)) -> dict[str, Any]:
     """Row/column counts plus per-column basic stats (adapts to column types)."""

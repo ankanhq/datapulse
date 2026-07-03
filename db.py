@@ -153,3 +153,19 @@ def get_report(token: str) -> Optional[dict]:
     if not row:
         return None
     return {"token": row[0], "user_id": row[1], "payload": json.loads(row[2])}
+
+
+# --- account deletion (GDPR) -----------------------------------------------
+
+def delete_user_data(user_id: str) -> list[str]:
+    """Delete every dataset and report owned by ``user_id``.
+
+    Returns the ids of the deleted datasets so the caller can also drop any live
+    in-memory tables. Scoped strictly to the given user — nothing else is touched.
+    """
+    with _lock:
+        cur = _exec("SELECT id FROM datasets WHERE user_id = ?", (user_id,))
+        dataset_ids = [r[0] for r in cur.fetchall()]
+        _exec("DELETE FROM datasets WHERE user_id = ?", (user_id,))
+        _exec("DELETE FROM reports WHERE user_id = ?", (user_id,))
+    return dataset_ids

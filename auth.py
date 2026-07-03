@@ -114,3 +114,27 @@ def user_id_from_token(token: str) -> str:
     if not sub:
         raise AuthError("Token has no subject")
     return str(sub)
+
+
+def delete_auth_user(user_id: str) -> bool:
+    """Delete a Supabase auth user via the admin API (GDPR account deletion).
+
+    Requires the service-role key (admin scope); returns True on success, False if
+    the key is unset or Supabase rejects the request. The caller decides how to
+    treat a False (the user's data is still removed regardless).
+    """
+    if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY):
+        return False
+    req = urllib.request.Request(
+        f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}",
+        headers={
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        },
+        method="DELETE",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status in (200, 204)
+    except Exception:  # noqa: BLE001 - any failure -> report not-removed
+        return False
