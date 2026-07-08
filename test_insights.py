@@ -116,13 +116,36 @@ def test_categories_present():
         assert expected in cats, f"category {expected} not produced"
 
 
-def test_top_insights_ranked():
-    ds = _load_sample()
+def test_top_insights_ranked(tmp_path):
+    # Use the pattern-rich "story" sample so there ARE strong findings to rank.
+    # (The uniform-random sample has no real patterns, so it correctly yields the
+    # honest "no strong patterns" note instead — see test_top_insights_honest_note.)
+    import generate_data
+
+    p = tmp_path / "story.csv"
+    generate_data.generate_story(str(p), days=180, seed=7)
+    ds = _paste(p.read_text(), name="story")
     rep = client.get(f"/datasets/{ds}/insights").json()
     tops = [i for i in rep["insights"] if i["category"] == "top_insights"]
     assert 1 <= len(tops) <= 3
     ranks = [i["supporting_metrics"]["rank"] for i in tops]
     assert ranks == sorted(ranks) and ranks[0] == 1
+    # Fix 2: nothing-burgers never headline — every Top insight beats the trust floor.
+    assert all(i["trust_score"] > 20 for i in tops), [(i["title"], i["trust_score"]) for i in tops]
+
+
+def test_top_insights_honest_note_when_no_strong_pattern():
+    # Uniform-random data has no strong pattern; the Top section must say so
+    # honestly rather than padding with high-trust "all-clear" non-findings.
+    import random
+
+    random.seed(11)
+    rows = ["a,b"] + [f"{random.random():.3f},{random.random():.3f}" for _ in range(15)]
+    ds = _paste("\n".join(rows))
+    rep = client.get(f"/datasets/{ds}/insights").json()
+    tops = [i for i in rep["insights"] if i["category"] == "top_insights"]
+    assert len(tops) == 1 and tops[0]["is_limitation"] is True
+    assert "No strong patterns found" in tops[0]["title"]
 
 
 def test_audience_mode_changes_words_not_math():
@@ -158,11 +181,14 @@ def test_invalid_mode_falls_back():
 def _synthetic_csv():
     # 40 rows: y = 2*x (perfect linear) EXCEPT one planted outlier (row x=20 -> y=1000).
     # grp is "A" for 35 rows and "B" for 5 -> A dominates ~87.5%.
+    # y is written as a float so it reads as a continuous MEASUREMENT: identifier
+    # detection now (correctly) excludes integer sequences/all-distinct integer
+    # columns from outlier analysis, and y is the measurement we're outlier-testing.
     lines = ["date,x,y,grp"]
     for i in range(1, 41):
-        y = 2 * i
+        y = 2.0 * i
         if i == 20:
-            y = 1000  # planted outlier
+            y = 1000.0  # planted outlier
         grp = "A" if i <= 35 else "B"
         lines.append(f"2024-01-{i:02d},{i},{y},{grp}")
     return "\n".join(lines)
@@ -191,9 +217,12 @@ def test_anomaly_evidence_rows_are_really_outliers():
 
 def _clean_linear_csv():
     # y = 2*x with no outliers -> a (near-)perfect positive correlation.
+    # Both are floats so they read as continuous MEASUREMENTS: identifier
+    # detection excludes integer id/index/sequence columns from correlation, and
+    # here x and y are the two measurements whose relationship we're testing.
     lines = ["x,y,grp"]
     for i in range(1, 41):
-        lines.append(f"{i},{2*i},{'A' if i <= 35 else 'B'}")
+        lines.append(f"{float(i)},{float(2*i)},{'A' if i <= 35 else 'B'}")
     return "\n".join(lines)
 
 
@@ -223,7 +252,9 @@ def test_concentration_matches_dominant_group():
 
 
 def test_small_sample_flagged_and_limitations_honest():
-    tiny = "a,b\n1,2\n3,4\n5,6\n"  # 3 rows
+    # 3 rows; floats so a/b read as measurements (integer sequences would now be
+    # flagged as identifiers and excluded, leaving no column to decline on).
+    tiny = "a,b\n1.0,2.0\n3.0,4.0\n5.0,6.0\n"  # 3 rows
     ds = _paste(tiny)
     rep = client.get(f"/datasets/{ds}/insights").json()
     assert rep["data_quality"]["small_sample_warning"]["triggered"] is True

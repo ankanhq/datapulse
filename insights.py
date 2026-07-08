@@ -42,6 +42,7 @@ from __future__ import annotations
 import concurrent.futures as _futures
 import logging
 import os
+import re
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from itertools import combinations
@@ -67,6 +68,19 @@ STRONG_CORR = 0.30         # |r| at/above this is reported as a real relationshi
 MIN_HALF_N = 5             # min rows per half for what-changed-most
 EVIDENCE_CAP = 25          # max row ids attached to a single insight
 FULL_SAMPLE = 50.0         # rows at which sample_weight saturates to 1.0
+
+# Correlation title bands by |r| (see _corr_relation).
+WEAK_CORR = 0.20           # below this two columns are reported as "unrelated"
+MODERATE_CORR = 0.40       # 0.40..0.69 is "moderately related"
+STRONG_CORR_TITLE = 0.70   # at/above this is "strongly related"
+
+# Top-insights gating (Fix 2): drop nothing-burgers, don't pad a weak headline.
+TOP_MIN_TRUST = 20         # a headline "Top insight" must beat this trust score
+TOP_STRONG_TRUST = 40      # need >=2 findings above this to justify a Top section
+
+# Identifier detection (Fix 4).
+ID_UNIQUE_FRAC = 0.95      # distinct >= 95% of rows -> treated as an identifier
+_ID_NAME_TOKENS = {"id", "uuid", "key", "index"}
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +132,74 @@ def _trust(n: int, missing_frac: float, consistency: float) -> int:
     completeness_w = max(0.0, 1.0 - max(0.0, missing_frac))
     consistency_w = max(0.0, min(1.0, consistency))
     return int(round(100 * sample_w * completeness_w * consistency_w))
+
+
+def _corr_relation(r: float) -> tuple[str, str]:
+    """Map a Pearson r to an honest (relation_word, strength_word) pair.
+
+    The relation word drives the TITLE and must reflect |r|, never overclaim:
+    <0.20 unrelated · 0.20–0.39 weakly · 0.40–0.69 moderately · >=0.70 strongly.
+    """
+    ar = abs(r)
+    if ar < WEAK_CORR:
+        return "unrelated", "negligible"
+    if ar < MODERATE_CORR:
+        return "weakly related", "weak"
+    if ar < STRONG_CORR_TITLE:
+        return "moderately related", "moderate"
+    return "strongly related", "strong"
+
+
+def _looks_like_id_name(name: str) -> bool:
+    """True if a column name reads like an identifier (id, _id, uuid, key, index)."""
+    low = name.lower()
+    if low == "id" or low.endswith("_id"):
+        return True
+    tokens = [t for t in re.split(r"[^a-z0-9]+", low) if t]
+    return any(t in _ID_NAME_TOKENS for t in tokens)
+
+
+def _identifier_columns(cur, table, numeric, integer_cols, where, params, total) -> set[str]:
+    """Numeric columns that are identifiers, not measurements — excluded from
+    correlation and outlier analysis (Fix 4).
+
+    A column is flagged when it (a) is named like an id, (b) has (near-)unique
+    values (distinct >= 95% of rows), or (c) is strictly monotonic increasing by
+    rowid. The cardinality/order tests (b, c) only apply to INTEGER-typed columns:
+    real ids, keys, indexes and sequences are integers (or text), whereas a
+    continuous float measurement (revenue, price, latency) is routinely
+    all-distinct and must NOT be mistaken for an identifier. Best-effort: a probe
+    failing on one column just leaves it unflagged.
+    """
+    ids: set[str] = set()
+    for name in numeric:
+        if _looks_like_id_name(name):
+            ids.add(name)
+            continue
+        if name not in integer_cols:
+            continue  # float/decimal measurement — never an id by shape alone
+        ident = _qi(name)
+        try:
+            nd, nn = cur.execute(
+                f"SELECT COUNT(DISTINCT {ident}), COUNT({ident}) FROM {_qi(table)}{where}", params
+            ).fetchone()
+            nd, nn = int(nd or 0), int(nn or 0)
+            if total and nd >= ID_UNIQUE_FRAC * total:
+                ids.add(name)
+                continue
+            # strictly increasing by rowid -> a sequence/index, not a measurement
+            if nn >= 2:
+                w = _augment(where, f"{ident} IS NOT NULL")
+                viol = int(cur.execute(
+                    f"SELECT COUNT(*) FROM (SELECT {ident} AS v, "
+                    f"LAG({ident}) OVER (ORDER BY rowid) AS p FROM {_qi(table)}{w}) "
+                    f"WHERE p IS NOT NULL AND v <= p", params
+                ).fetchone()[0])
+                if viol == 0:
+                    ids.add(name)
+        except Exception as exc:  # noqa: BLE001 - a bad probe just means "not flagged"
+            log.warning("insights: identifier probe failed for %r: %r", name, exc)
+    return ids
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +473,19 @@ def _compute(con, table, columns, where, params, mode, numeric, dates, texts, al
             "follow_up_questions": ["Which filter is excluding all rows?"],
         }
 
+    # Identifier columns (row ids, sequences, keys) are numeric in type but are
+    # not measurements — analyzing them as such yields meaningless correlations
+    # and "outliers". Flag once and exclude from those sections (Fix 4). They stay
+    # in the schema/stat chips (summary, missing) untouched.
+    integer_cols = {c["name"] for c in columns
+                    if c["type"] == "number" and "INT" in (c.get("sql_type") or "").upper()}
+    try:
+        id_cols = _identifier_columns(con.cursor(), table, numeric, integer_cols, where, params, total)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("insights: identifier detection failed: %r", exc)
+        id_cols = set()
+    numeric_measures = [c for c in numeric if c not in id_cols]
+
     facts_exec = _exec_facts(summary, total, numeric, dates, texts)
     insights: list[dict] = []
 
@@ -405,27 +500,56 @@ def _compute(con, table, columns, where, params, mode, numeric, dates, texts, al
     findings += _guarded(con, "Hidden patterns", "hidden_patterns", texts + dates,
         lambda cur: (_concentration_insights(cur, table, texts, where, params, total, missing_frac, mode)
                      + _trend_insights(cur, table, dates, numeric, where, params, total, missing_frac, mode)))
-    findings += _guarded(con, "Correlations", "correlations", numeric,
-        lambda cur: _correlation_insights(cur, table, numeric, where, params, missing_frac, mode))
-    findings += _guarded(con, "Anomalies", "anomalies", numeric,
-        lambda cur: _anomaly_insights(cur, table, numeric, where, params, total, missing_frac, mode))
+    findings += _guarded(con, "Correlations", "correlations", numeric_measures,
+        lambda cur: _correlation_insights(cur, table, numeric_measures, where, params, missing_frac, mode))
+    findings += _guarded(con, "Anomalies", "anomalies", numeric_measures,
+        lambda cur: _anomaly_insights(cur, table, numeric_measures, where, params, total, missing_frac, mode))
     findings += _guarded(con, "What changed most", "what_changed_most", dates + texts,
         lambda cur: _what_changed_insights(cur, table, dates, texts, numeric, where, params, missing_frac, mode))
 
-    # top_insights: the 3 most notable *real* findings (not limitations), ranked.
+    # top_insights (Fix 2): only real, high-trust findings headline here. Drop
+    # nothing-burgers (trust <= TOP_MIN_TRUST), rank by trust then effect size,
+    # and if there aren't at least two genuinely strong findings, don't pad the
+    # section — say so honestly. Low-trust items still live in their detailed
+    # sections below (they're all appended to `insights` afterwards).
     try:
-        ranked = sorted(
-            [f for f in findings if not f["is_limitation"]],
-            key=lambda f: f["_notability"], reverse=True,
+        # Eligible = real findings only: not a limitation, trust above the floor,
+        # and a non-zero effect size. The effect-size gate is what makes
+        # "nothing-burgers sink or drop": all-clear/descriptive cards ("No column
+        # is badly incomplete", "No IQR outliers found") carry high trust but zero
+        # notability, so they never headline as a Top insight.
+        eligible = sorted(
+            [f for f in findings if not f["is_limitation"]
+             and f["trust_score"] > TOP_MIN_TRUST and f["_notability"] > 0],
+            key=lambda f: (f["trust_score"], f["_notability"]), reverse=True,
         )
-        for rank, src in enumerate(ranked[:3], start=1):
-            top = dict(src)
-            top["id"] = f"top_insight_{rank}"
-            top["category"] = "top_insights"
-            top["title"] = f"#{rank}: {src['title']}"
-            top["supporting_metrics"] = {"rank": rank, "source_insight": src["id"],
-                                         **src["supporting_metrics"]}
-            insights.append(top)
+        strong = [f for f in eligible if f["trust_score"] > TOP_STRONG_TRUST]
+        if len(strong) >= 2:
+            for rank, src in enumerate(eligible[:3], start=1):
+                top = dict(src)
+                top["id"] = f"top_insight_{rank}"
+                top["category"] = "top_insights"
+                top["title"] = f"#{rank}: {src['title']}"
+                top["supporting_metrics"] = {"rank": rank, "source_insight": src["id"],
+                                             **src["supporting_metrics"]}
+                insights.append(top)
+        else:
+            insights.append(_insight(
+                id="top_insights_none",
+                title="No strong patterns found in these columns. Here's what we checked.",
+                category="top_insights",
+                explanation="No finding cleared the trust bar to headline here. The checks we "
+                            "ran — completeness, concentration, trends, correlations, anomalies "
+                            "and period-over-period change — appear in their own sections below, "
+                            "each with its confidence and trust score, so nothing is overstated.",
+                why_it_matters="Promoting weak or low-evidence findings as headlines would claim "
+                               "more than the data supports.",
+                confidence=0.0, trust_score=0, is_limitation=True,
+                evidence_columns=all_names,
+                what_to_check_next="Add more rows, cleaner columns, or a clear date/segment to "
+                                   "strengthen the analysis.",
+                notability=0.0,
+            ))
     except Exception as exc:  # noqa: BLE001
         log.warning("insights: ranking top insights failed: %r", exc)
 
@@ -644,7 +768,7 @@ def _missing_insights(cur, table, columns, where, params, total, missing_by_colu
 
 def _concentration_insights(cur, table, texts, where, params, total, missing_frac, mode) -> list[dict]:
     out: list[dict] = []
-    scored: list[tuple[float, str, str, int]] = []  # (share, col, label, count)
+    scored: list[tuple[float, str, str, int, int]] = []  # (share, col, label, count, ndistinct)
     for name in texts:
         ident = _qi(name)
         row = cur.execute(
@@ -655,10 +779,31 @@ def _concentration_insights(cur, table, texts, where, params, total, missing_fra
             continue
         label, count = row[0], int(row[1])
         share = count / total if total else 0.0
-        scored.append((share, name, label, count))
+        ndistinct = int(cur.execute(
+            f"SELECT COUNT(DISTINCT {ident}) FROM {_qi(table)}{where}", params
+        ).fetchone()[0] or 0)
+        scored.append((share, name, label, count, ndistinct))
 
     scored.sort(reverse=True)
-    for share, name, label, count in scored[:2]:
+    for share, name, label, count, ndistinct in scored[:2]:
+        # Fix 3: a column with a single distinct value can't "dominate" or explain
+        # anything — reframe it honestly instead of claiming 100% concentration.
+        if ndistinct <= 1:
+            out.append(_insight(
+                id=f"single_value_{name}",
+                title=f"'{name}' has only one value ('{label}')",
+                category="hidden_patterns",
+                explanation=f"Every non-empty row of {name} is '{label}' (1 distinct value), "
+                            "so this column can't segment the data or explain any difference.",
+                why_it_matters="A constant column adds no analytical signal — it can't split, "
+                               "compare or predict anything.",
+                confidence=0.0, trust_score=15, is_limitation=True,
+                evidence_columns=[name],
+                supporting_metrics={"column": name, "distinct_values": 1, "only_value": label},
+                what_to_check_next=f"Drop {name} from analysis, or add rows with other values.",
+                notability=0.0,
+            ))
+            continue
         if share < CONCENTRATION_FLAG:
             continue
         ev_rows = _rowids(cur, table, where, params,
@@ -721,8 +866,25 @@ def _trend_insights(cur, table, dates, numeric, where, params, total, missing_fr
     ss_res = float(np.sum((y - yhat) ** 2))
     ss_tot = float(np.sum((y - y.mean()) ** 2))
     r2 = 0.0 if ss_tot == 0 else max(0.0, 1 - ss_res / ss_tot)
-    direction = "increasing" if slope > 0 else "decreasing" if slope < 0 else "flat"
     first_c, last_c = int(y[0]), int(y[-1])
+
+    # Fix 1: the title must match the math. A slope that rounds to 0 at the
+    # displayed precision (2 dp), or a poor fit (R² < STRONG_CORR), is NOT a
+    # trend — say "No clear trend over time" and don't claim a direction.
+    slope_disp = round(float(slope), 2)
+    trend_clear = (r2 >= STRONG_CORR) and (abs(slope_disp) > 0)
+    if trend_clear:
+        direction = "increasing" if slope > 0 else "decreasing"
+        title = f"Row volume is {direction} over time"
+        trend_phrase = f"a {direction} trend"
+        next_step = f"Check whether the {direction} trend in {name} is seasonal or a real shift."
+        note = ""
+    else:
+        direction = "flat"
+        title = "No clear trend over time"
+        trend_phrase = "no clear trend"
+        next_step = f"Look for seasonality or segment-level movement in {name}; the overall line is flat/noisy."
+        note = " The slope is negligible or R² is below 0.30, so no direction is reliable."
 
     # evidence: earliest and latest rows in time
     ev_rows = (_rowids(cur, table, where, params, extra_sql=f"{ident} IS NOT NULL",
@@ -730,11 +892,10 @@ def _trend_insights(cur, table, dates, numeric, where, params, total, missing_fr
                + _rowids(cur, table, where, params, extra_sql=f"{ident} IS NOT NULL",
                          order_by=f"{ident} DESC", limit=5))
     return [_insight(
-        id="trend", title=f"Row volume is {direction} over time", category="hidden_patterns",
-        explanation=f"Fitting a line to daily counts over {name} gives a {direction} trend "
+        id="trend", title=title, category="hidden_patterns",
+        explanation=f"Fitting a line to daily counts over {name} shows {trend_phrase} "
                     f"(slope {slope:+.2f} rows/day, R²={r2:.2f}). First bucket {first_c:,} → "
-                    f"last bucket {last_c:,}."
-                    + (" R² is low, so the trend is weak/noisy." if r2 < 0.3 else ""),
+                    f"last bucket {last_c:,}." + note,
         why_it_matters=_why("trend", mode, {}),
         confidence=_confidence(total, r2),
         trust_score=_trust(total, missing_frac.get(name, 0.0), r2),
@@ -743,7 +904,7 @@ def _trend_insights(cur, table, dates, numeric, where, params, total, missing_fr
                             "r_squared": round(r2, 4), "buckets": len(rows),
                             "first_bucket_count": first_c, "last_bucket_count": last_c,
                             "direction": direction},
-        what_to_check_next=f"Check whether the {direction} trend in {name} is seasonal or a real shift.",
+        what_to_check_next=next_step,
         notability=r2,
     )]
 
@@ -788,7 +949,16 @@ def _correlation_insights(cur, table, numeric, where, params, missing_frac, mode
 
     pairs.sort(key=lambda p: abs(p[0]), reverse=True)
     r, a, b, n = pairs[0]
-    strength = ("strong" if abs(r) >= 0.6 else "moderate" if abs(r) >= STRONG_CORR else "weak")
+    # Fix 1: the title must reflect |r|, never claim "move together" for a
+    # relationship the number disproves. _corr_relation gives the honest band.
+    relation, strength = _corr_relation(r)
+    ar = abs(r)
+    if ar < WEAK_CORR:
+        caveat = " In practice these two are effectively unrelated."
+    elif ar < MODERATE_CORR:
+        caveat = " The relationship is weak, so treat it cautiously."
+    else:
+        caveat = ""
     ia = _qi(a)
     # evidence: a few lowest-a and highest-a rows (both cols present) to show co-movement
     cond = f"{ia} IS NOT NULL AND {_qi(b)} IS NOT NULL"
@@ -796,20 +966,19 @@ def _correlation_insights(cur, table, numeric, where, params, missing_frac, mode
                + _rowids(cur, table, where, params, extra_sql=cond, order_by=f"{ia} DESC", limit=4))
     others = [{"pair": [pa, pb], "r": round(pr, 4), "n": pn} for pr, pa, pb, pn in pairs[1:4]]
     return [_insight(
-        id="correlation_top", title=f"{a} and {b} move together ({strength})",
+        id="correlation_top", title=f"{a} and {b} are {relation}",
         category="correlations",
         explanation=f"Pearson r = {r:+.2f} between {a} and {b} over n={n:,} paired rows "
                     f"(r²={r*r:.2f}). This is a {strength} linear relationship; it is "
-                    f"association, not proof of causation."
-                    + (" The relationship is weak, so treat it cautiously." if abs(r) < STRONG_CORR else ""),
+                    f"association, not proof of causation." + caveat,
         why_it_matters=_why("correlation", mode, {}),
-        confidence=_confidence(n, abs(r)),
-        trust_score=_trust(n, (missing_frac.get(a, 0.0) + missing_frac.get(b, 0.0)) / 2, abs(r)),
+        confidence=_confidence(n, ar),
+        trust_score=_trust(n, (missing_frac.get(a, 0.0) + missing_frac.get(b, 0.0)) / 2, ar),
         evidence_rows=ev_rows, evidence_columns=[a, b],
         supporting_metrics={"pair": [a, b], "pearson_r": round(r, 4), "r_squared": round(r * r, 4),
                             "n": n, "strength": strength, "other_strong_pairs": others},
         what_to_check_next=f"Plot {a} vs {b} and check whether a third variable explains the link.",
-        notability=abs(r),
+        notability=ar,
     )]
 
 
@@ -959,40 +1128,45 @@ def _what_changed_insights(cur, table, dates, texts, numeric, where, params, mis
             f"{_augment(where, after)} GROUP BY 1", [*params, mid_e]
         ).fetchall())
         labels = set(first) | set(second)
-        movers = []
-        for lb in labels:
-            f0, s0 = int(first.get(lb, 0)), int(second.get(lb, 0))
-            movers.append({"label": lb, "first_half": f0, "second_half": s0, "delta": s0 - f0})
-        movers.sort(key=lambda m: abs(m["delta"]), reverse=True)
-        n_first = sum(int(v) for v in first.values())
-        n_second = sum(int(v) for v in second.values())
-        if not movers or (n_first < MIN_HALF_N and n_second < MIN_HALF_N):
-            return []
-        top = movers[0]
-        base = max(1, top["first_half"])
-        pct = 100 * top["delta"] / base
-        ev_rows = _rowids(cur, table, where, params,
-                          extra_sql=f"CAST({gid} AS VARCHAR) = ?", extra_params=[top["label"]])
-        effect = min(1.0, abs(top["delta"]) / base)
-        return [_insight(
-            id="what_changed", title=f"'{top['label']}' changed most in {dim}",
-            category="what_changed_most",
-            explanation=f"Splitting {date_col} at its midpoint, '{top['label']}' in {dim} went "
-                        f"from {top['first_half']:,} to {top['second_half']:,} rows "
-                        f"({top['delta']:+,}, {pct:+.0f}%) — the biggest mover across "
-                        f"{len(labels)} groups.",
-            why_it_matters=_why("what_changed", mode, {}),
-            confidence=_confidence(n_first + n_second, effect),
-            trust_score=_trust(n_first + n_second, missing_frac.get(dim, 0.0), min(1.0, effect + 0.2)),
-            evidence_rows=ev_rows, evidence_columns=[date_col, dim],
-            supporting_metrics={"date_column": date_col, "dimension": dim,
-                                "midpoint": midpoint, "top_movers": movers[:6],
-                                "first_half_rows": n_first, "second_half_rows": n_second},
-            what_to_check_next=f"Investigate what drove '{top['label']}' between the two halves.",
-            notability=effect,
-        )]
+        # Fix 3: a single group is not a comparison — never claim a "biggest mover
+        # across 1 groups". Skip the grouped analysis and fall through to the
+        # overall-volume change below (the single-value column is separately
+        # flagged by the concentration section).
+        if len(labels) > 1:
+            movers = []
+            for lb in labels:
+                f0, s0 = int(first.get(lb, 0)), int(second.get(lb, 0))
+                movers.append({"label": lb, "first_half": f0, "second_half": s0, "delta": s0 - f0})
+            movers.sort(key=lambda m: abs(m["delta"]), reverse=True)
+            n_first = sum(int(v) for v in first.values())
+            n_second = sum(int(v) for v in second.values())
+            if not movers or (n_first < MIN_HALF_N and n_second < MIN_HALF_N):
+                return []
+            top = movers[0]
+            base = max(1, top["first_half"])
+            pct = 100 * top["delta"] / base
+            ev_rows = _rowids(cur, table, where, params,
+                              extra_sql=f"CAST({gid} AS VARCHAR) = ?", extra_params=[top["label"]])
+            effect = min(1.0, abs(top["delta"]) / base)
+            return [_insight(
+                id="what_changed", title=f"'{top['label']}' changed most in {dim}",
+                category="what_changed_most",
+                explanation=f"Splitting {date_col} at its midpoint, '{top['label']}' in {dim} went "
+                            f"from {top['first_half']:,} to {top['second_half']:,} rows "
+                            f"({top['delta']:+,}, {pct:+.0f}%) — the biggest mover across "
+                            f"{len(labels)} groups.",
+                why_it_matters=_why("what_changed", mode, {}),
+                confidence=_confidence(n_first + n_second, effect),
+                trust_score=_trust(n_first + n_second, missing_frac.get(dim, 0.0), min(1.0, effect + 0.2)),
+                evidence_rows=ev_rows, evidence_columns=[date_col, dim],
+                supporting_metrics={"date_column": date_col, "dimension": dim,
+                                    "midpoint": midpoint, "top_movers": movers[:6],
+                                    "first_half_rows": n_first, "second_half_rows": n_second},
+                what_to_check_next=f"Investigate what drove '{top['label']}' between the two halves.",
+                notability=effect,
+            )]
 
-    # no category — report overall volume change between halves
+    # no usable category — report overall volume change between halves
     n_first = int(cur.execute(
         f"SELECT COUNT(*) FROM {_qi(table)}{_augment(where, before)}", [*params, mid_e]
     ).fetchone()[0])
@@ -1035,7 +1209,7 @@ def _follow_ups(findings, data_quality, dates, numeric, texts) -> list[str]:
             qs.append(f"Are the {m.get('outlier_count')} outliers in {m.get('column')} errors or real extremes?")
         elif f["id"].startswith("concentration_"):
             qs.append(f"Why does '{m.get('dominant_value')}' dominate {m.get('column')}?")
-        elif f["id"] == "trend":
+        elif f["id"] == "trend" and m.get("direction") not in (None, "flat"):
             qs.append(f"Is the {m.get('direction')} trend in {m.get('date_column')} seasonal?")
         elif f["id"] == "what_changed" and "dimension" in m:
             qs.append(f"What changed for the top mover in {m.get('dimension')} between the two halves?")
