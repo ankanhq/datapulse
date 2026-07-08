@@ -90,6 +90,7 @@ Record the frontend URL, e.g. `https://datapulse-frontend.vercel.app`.
 - `DATAPULSE_MAX_DATASETS` — max in-memory datasets before LRU eviction (default 8)
 - `DATAPULSE_DATASET_TTL` — seconds before an idle dataset is evicted (default 1800)
 - `DATAPULSE_SAMPLE_ROWS` — row cap for the sample (default 50000)
+- `REFRESH_SECRET` — shared secret guarding `POST /internal/refresh-due`; must match the `REFRESH_SECRET` repo secret used by the `scheduled-refresh` GitHub Action (leave unset to disable scheduled auto-refresh — the endpoint then rejects every call)
 - `PORT` — injected by Render; the container binds to it automatically
 
 **Frontend (Vercel):**

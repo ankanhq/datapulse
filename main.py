@@ -14,6 +14,7 @@ Run with:
 from __future__ import annotations
 
 import csv
+import hmac
 import io
 import ipaddress
 import json
@@ -73,6 +74,15 @@ SAMPLE_ROW_CAP = int(os.getenv("DATAPULSE_SAMPLE_ROWS", "50000"))
 # would move to object storage or a database.
 REPORTS_DIR = os.getenv("DATAPULSE_REPORTS_DIR", "./.reports")
 MAX_REPORT_BYTES = 4 * 1024 * 1024  # guard against oversized report payloads
+
+# Shared secret guarding the internal /internal/refresh-due endpoint that the
+# scheduled GitHub Action calls. Unset -> the endpoint refuses every request.
+REFRESH_SECRET = os.getenv("REFRESH_SECRET", "")
+
+# Auto-refresh cadences and how stale (seconds) a dataset may be before a run
+# re-fetches it. 'off' is absent here so it never becomes due.
+AUTO_REFRESH_MODES = ("off", "hourly", "daily")
+_AUTO_REFRESH_INTERVAL = {"hourly": 3_600, "daily": 86_400}
 
 # Display/serving caps.
 MAX_CHART_BUCKETS = 2_000      # time-series granularity guard
@@ -724,7 +734,56 @@ def create_url_dataset(req: UrlRequest, user: str = Depends(require_user)) -> di
     try:
         ds = _create_dataset(path, name=(req.name or _name_from_url(url)),
                              source="url", user_id=user, source_url=url)
-        return ds.public()
+        # The data was just fetched, so seed last_refreshed_at from creation time;
+        # auto-refresh starts off until the user opts in.
+        db.set_last_refreshed(ds.id, ds.created_at)
+        return {**ds.public(), "auto_refresh": "off", "last_refreshed_at": ds.created_at}
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _refresh_from_source(meta: dict) -> dict[str, Any]:
+    """Re-fetch a URL-backed dataset from ``meta['source_url']`` and update it.
+
+    Shared by the user-facing refresh endpoint and the scheduled batch endpoint.
+    The new data is parsed into a temp table first; if the dataset is currently
+    loaded in memory its live table is swapped only after the fetch+parse succeed,
+    so a failed refresh leaves the existing data intact. If it isn't loaded (the
+    common case for the scheduler), only the persisted schema/row_count are
+    updated — the data is re-fetched on next access anyway — and no orphan table
+    is left behind. Persists the new metadata and stamps ``last_refreshed_at``.
+
+    Returns the refreshed public dataset shape. Raises HTTPException on failure.
+    """
+    assert con is not None
+    dataset_id = meta["id"]
+    source_url = meta["source_url"]
+    path = _fetch_csv_url(source_url)
+    tmp_table = f"ds_{uuid.uuid4().hex}"
+    try:
+        with _lock:
+            columns, row_count = _build_table_locked(tmp_table, path, None)
+            live = _registry.get(dataset_id)
+            if live is not None:
+                con.execute(f"DROP TABLE IF EXISTS {_qi(live.table)}")
+                con.execute(f"ALTER TABLE {_qi(tmp_table)} RENAME TO {_qi(live.table)}")
+                live.columns = columns
+                live.row_count = row_count
+                live.last_access = time.time()
+            else:
+                con.execute(f"DROP TABLE IF EXISTS {_qi(tmp_table)}")
+        now = time.time()
+        db.save_dataset(dataset_id, meta["user_id"], meta["name"], "url", source_url,
+                        columns, row_count, meta.get("created_at"))
+        db.set_last_refreshed(dataset_id, now)
+        return {
+            "dataset_id": dataset_id, "name": meta["name"], "source": "url",
+            "source_url": source_url, "row_count": row_count, "columns": columns,
+            "auto_refresh": meta.get("auto_refresh", "off"), "last_refreshed_at": now,
+        }
     finally:
         try:
             os.unlink(path)
@@ -736,36 +795,101 @@ def create_url_dataset(req: UrlRequest, user: str = Depends(require_user)) -> di
 def refresh_dataset(dataset_id: str, user: str = Depends(require_user)) -> dict[str, Any]:
     """Re-fetch a URL-backed dataset's source and replace its data in place.
 
-    Keeps the same dataset id (so the open view/filters stay valid). The new data
-    is loaded into a temp table first; the live table is only swapped out once the
-    fetch and parse succeed, so a failed refresh leaves the existing data intact.
+    Keeps the same dataset id (so the open view/filters stay valid).
     """
-    ds = _get_dataset(dataset_id, user)
-    if ds.source != "url" or not ds.source_url:
+    meta = db.get_dataset(dataset_id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="Dataset not found.")
+    if meta["user_id"] != user:
+        raise HTTPException(status_code=403, detail="You don't have access to this dataset.")
+    if meta["source"] != "url" or not meta["source_url"]:
         raise HTTPException(
             status_code=400,
             detail="This dataset has no source link to refresh. Refresh works on datasets "
                    "loaded from a CSV link.",
         )
-    path = _fetch_csv_url(ds.source_url)
-    tmp_table = f"ds_{uuid.uuid4().hex}"
-    try:
-        assert con is not None
-        with _lock:
-            columns, row_count = _build_table_locked(tmp_table, path, None)
-            con.execute(f"DROP TABLE IF EXISTS {_qi(ds.table)}")
-            con.execute(f"ALTER TABLE {_qi(tmp_table)} RENAME TO {_qi(ds.table)}")
-            ds.columns = columns
-            ds.row_count = row_count
-            ds.last_access = time.time()
-        db.save_dataset(ds.id, ds.user_id, ds.name, ds.source, ds.source_url,
-                        ds.columns, ds.row_count, ds.created_at)
-        return ds.public()
-    finally:
+    return _refresh_from_source(meta)
+
+
+class AutoRefreshRequest(BaseModel):
+    mode: str  # 'off' | 'hourly' | 'daily'
+
+
+@app.post("/datasets/{dataset_id}/auto-refresh")
+def set_auto_refresh(dataset_id: str, req: AutoRefreshRequest,
+                     user: str = Depends(require_user)) -> dict[str, Any]:
+    """Set the auto-refresh cadence for the caller's OWN url-backed dataset.
+
+    Ownership comes from the verified token; a user can only change their own
+    datasets. Only url-backed datasets have a source to re-fetch, so anything
+    else is rejected.
+    """
+    if req.mode not in AUTO_REFRESH_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"mode must be one of: {', '.join(AUTO_REFRESH_MODES)}.",
+        )
+    meta = db.get_dataset(dataset_id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="Dataset not found.")
+    if meta["user_id"] != user:
+        raise HTTPException(status_code=403, detail="You don't have access to this dataset.")
+    if meta["source"] != "url" or not meta["source_url"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Auto-refresh is only available for datasets loaded from a CSV link.",
+        )
+    db.set_auto_refresh(dataset_id, req.mode)
+    return {
+        "dataset_id": dataset_id,
+        "auto_refresh": req.mode,
+        "last_refreshed_at": meta.get("last_refreshed_at"),
+    }
+
+
+@app.post("/internal/refresh-due")
+def internal_refresh_due(
+    x_refresh_secret: Optional[str] = Header(None),
+) -> dict[str, Any]:
+    """Scheduler-only: refresh every url-backed dataset whose auto-refresh is due.
+
+    Protected by the shared ``REFRESH_SECRET`` (sent in the ``X-Refresh-Secret``
+    header), NOT by user auth — it acts across all users' datasets. Due means the
+    dataset's ``last_refreshed_at`` is older than its cadence (hourly = 1h,
+    daily = 24h). Resilient by design: each dataset is refreshed in isolation and
+    an individual failure is recorded and skipped, never aborting the whole run.
+    """
+    if not REFRESH_SECRET or not x_refresh_secret or not hmac.compare_digest(
+        x_refresh_secret, REFRESH_SECRET
+    ):
+        raise HTTPException(status_code=403, detail="Forbidden.")
+
+    now = time.time()
+    candidates = db.list_due_datasets()
+    refreshed: list[str] = []
+    skipped: list[dict[str, Any]] = []
+    due = 0
+    for meta in candidates:
+        interval = _AUTO_REFRESH_INTERVAL.get(meta.get("auto_refresh"))
+        if interval is None:
+            continue
+        last = meta.get("last_refreshed_at") or 0
+        if now - last < interval:
+            continue  # not due yet
+        due += 1
         try:
-            os.unlink(path)
-        except OSError:
-            pass
+            _refresh_from_source(meta)
+            refreshed.append(meta["id"])
+        except Exception as exc:  # noqa: BLE001 - isolate per-dataset failures
+            detail = getattr(exc, "detail", None) or str(exc)
+            skipped.append({"dataset_id": meta["id"], "error": str(detail)[:200]})
+    return {
+        "ran_at": now,
+        "candidates": len(candidates),
+        "due": due,
+        "refreshed": refreshed,
+        "skipped": skipped,
+    }
 
 
 @app.post("/datasets/sample")
@@ -792,6 +916,7 @@ def list_datasets(user: str = Depends(require_user)) -> dict[str, Any]:
             "dataset_id": d["id"], "name": d["name"], "source": d["source"],
             "source_url": d["source_url"], "row_count": d["row_count"],
             "columns": d["schema"], "created_at": d["created_at"],
+            "auto_refresh": d["auto_refresh"], "last_refreshed_at": d["last_refreshed_at"],
         }
         for d in db.list_datasets(user)
     ]

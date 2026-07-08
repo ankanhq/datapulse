@@ -1,0 +1,39 @@
+name: scheduled-refresh
+
+# Drives auto-refresh for URL-backed (e.g. Google Sheet) datasets. Every 30
+# minutes this calls the backend's internal /internal/refresh-due endpoint, which
+# re-fetches any dataset whose cadence is due (hourly = older than 1h, daily =
+# older than 24h). The endpoint itself decides what's due and is resilient to
+# individual dataset failures, so this job just needs to call it and report.
+#
+# The shared secret lives in the repo secret REFRESH_SECRET and must match the
+# REFRESH_SECRET env var set on the backend (Render). Without a matching secret
+# the endpoint returns 403 and nothing is refreshed.
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger due auto-refreshes
+        env:
+          # Override in repo settings (Variables) if the backend URL changes.
+          API_URL: ${{ vars.REFRESH_URL || 'https://datapulse-api-gm5r.onrender.com/internal/refresh-due' }}
+          REFRESH_SECRET: ${{ secrets.REFRESH_SECRET }}
+        run: |
+          if [ -z "$REFRESH_SECRET" ]; then
+            echo "::error::REFRESH_SECRET repo secret is not set."
+            exit 1
+          fi
+          # Render free tier can cold-start (~30s), so allow a generous timeout.
+          body=$(mktemp)
+          code=$(curl -s -o "$body" -w "%{http_code}" --max-time 120 \
+            -X POST "$API_URL" \
+            -H "X-Refresh-Secret: $REFRESH_SECRET" || echo "000")
+          echo "POST $API_URL -> $code"
+          cat "$body"; echo
+          # Don't fail the workflow on a transient blip; the next run retries.
+          if [ "$code" != "200" ]; then echo "::warning::refresh-due returned $code"; fi
