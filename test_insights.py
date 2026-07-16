@@ -251,6 +251,98 @@ def test_concentration_matches_dominant_group():
     assert rows and all(r["grp"] == "A" for r in rows)
 
 
+# --------------------------------------------------------------------------
+# "So what" interpretation layer: comparative leader framing + time patterns.
+# --------------------------------------------------------------------------
+
+def _leader_weekday_csv():
+    """A crafted dataset with a CLEAR leader ('Alpha', also #1 overall, surging in
+    the later half) and a strong WEDNESDAY skew, spanning multiple months — so the
+    leader-framing clause, the runner-up clause and the busiest-weekday insight all
+    fire deterministically."""
+    import datetime as _dt
+
+    lines = ["date,product"]
+    start = _dt.date(2026, 1, 5)  # a Monday
+    for wk in range(12):          # 12 weeks -> spans Jan, Feb, Mar
+        for dow in range(7):
+            d = start + _dt.timedelta(days=wk * 7 + dow)
+            alpha_n = 2 if wk < 6 else 6  # Alpha surges in the later half
+            for _ in range(alpha_n):
+                lines.append(f"{d.isoformat()},Alpha")
+            for _ in range(2):            # Beta stays flat
+                lines.append(f"{d.isoformat()},Beta")
+            if d.weekday() == 2:          # Wednesday spike (all Alpha)
+                for _ in range(12):
+                    lines.append(f"{d.isoformat()},Alpha")
+    return "\n".join(lines)
+
+
+def test_leader_framing_clause_and_metrics():
+    ds = _paste(_leader_weekday_csv(), name="leader_weekday")
+    insights = client.get(f"/datasets/{ds}/insights", params={"mode": "founder"}).json()["insights"]
+
+    # Part 1a: the biggest-mover card frames the leader against the runner-up.
+    wc = next((i for i in insights if i["id"] == "what_changed"), None)
+    assert wc is not None and not wc["is_limitation"]
+    m = wc["supporting_metrics"]
+    assert m["second_label"] == "Beta"
+    assert m["leader_total"] > m["second_total"] > 0
+    assert m["lead_pct"] > 0
+    assert "now the top" in wc["explanation"] and "Beta" in wc["explanation"]
+
+    # Part 1b: the concentration card names the runner-up with its real share.
+    conc = next((i for i in insights if i["id"] == "concentration_product"), None)
+    assert conc is not None
+    assert conc["supporting_metrics"]["runner_up"] == "Beta"
+    assert "more than the next" in conc["explanation"]
+
+
+def test_busiest_weekday_insight():
+    ds = _paste(_leader_weekday_csv(), name="leader_weekday")
+    insights = client.get(f"/datasets/{ds}/insights", params={"mode": "founder"}).json()["insights"]
+
+    tp = next((i for i in insights if i["id"] == "time_pattern"), None)
+    assert tp is not None and not tp["is_limitation"]
+    assert tp["category"] == "hidden_patterns"  # reuses an existing key (no FE change)
+    sm = tp["supporting_metrics"]
+    assert sm["busiest_weekday"] == "Wednesday"
+    assert sm["busiest_weekday_pct"] > sm["even_day_pct"]
+    assert sm["peak_month"] is not None  # data spans >= 2 months
+    # plain, meaning-first, real weekday name (never an index)
+    assert "Wednesday" in tp["explanation"] and "busiest" in tp["explanation"].lower()
+    assert tp["evidence_columns"] == ["date"]
+    assert tp["evidence_rows"]
+
+
+def test_time_pattern_technical_clause_only_for_technical_modes():
+    ds = _paste(_leader_weekday_csv(), name="leader_weekday")
+    founder = client.get(f"/datasets/{ds}/insights", params={"mode": "founder"}).json()["insights"]
+    analyst = client.get(f"/datasets/{ds}/insights", params={"mode": "analyst"}).json()["insights"]
+    f_tp = next(i for i in founder if i["id"] == "time_pattern")
+    a_tp = next(i for i in analyst if i["id"] == "time_pattern")
+    # identical numbers across audiences; only the wording changes
+    assert f_tp["supporting_metrics"] == a_tp["supporting_metrics"]
+    assert f_tp["confidence"] == a_tp["confidence"]
+    assert f_tp["trust_score"] == a_tp["trust_score"]
+    assert "even day" not in f_tp["explanation"]   # plain audience: no technical clause
+    assert "even day" in a_tp["explanation"]        # analyst: one technical clause
+
+
+def test_flat_weekday_emits_no_time_pattern():
+    # Perfectly even weekdays (one row per day) must NOT invent a busiest-weekday card.
+    import datetime as _dt
+
+    start = _dt.date(2026, 1, 5)
+    lines = ["date,product"]
+    for i in range(140):  # 20 full weeks -> each weekday appears exactly 20 times
+        d = start + _dt.timedelta(days=i)
+        lines.append(f"{d.isoformat()},Alpha")
+    ds = _paste("\n".join(lines), name="flat_week")
+    insights = client.get(f"/datasets/{ds}/insights").json()["insights"]
+    assert not any(i["id"] == "time_pattern" for i in insights)
+
+
 def test_small_sample_flagged_and_limitations_honest():
     # 3 rows; floats so a/b read as measurements (integer sequences would now be
     # flagged as identifiers and excluded, leaving no column to decline on).

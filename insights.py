@@ -282,6 +282,13 @@ _WHY_TEMPLATES: dict[str, dict[str, str]] = {
         "manager": "Whether things are improving or sliding over the period covered.",
         "researcher": "Linear trend estimate over time; inspect residuals and R^2 before extrapolating.",
     },
+    "time_pattern": {
+        "student": "Knowing which day is busiest helps you plan around the rush.",
+        "analyst": "A weekly cycle this strong should be modelled (or removed) before reading any trend.",
+        "founder": "Your activity has a rhythm — the day it peaks is where staffing and pushes pay off.",
+        "manager": "The workload isn't even across the week; resourcing should follow the peak.",
+        "researcher": "A day-of-week effect of this size confounds level comparisons; control for it.",
+    },
     "what_changed": {
         "student": "Comparing the earlier half to the later half shows which group changed the most.",
         "analyst": "First-vs-second-half deltas isolate the segments driving the overall movement.",
@@ -509,7 +516,8 @@ def _compute(con, table, columns, where, params, mode, numeric, dates, texts, al
         lambda cur: _missing_insights(cur, table, columns, where, params, total, missing_by_column, mode))
     findings += _guarded(con, "Hidden patterns", "hidden_patterns", texts + dates,
         lambda cur: (_concentration_insights(cur, table, texts, where, params, total, missing_frac, mode)
-                     + _trend_insights(cur, table, dates, numeric, where, params, total, missing_frac, mode)))
+                     + _trend_insights(cur, table, dates, numeric, where, params, total, missing_frac, mode)
+                     + _time_pattern_insights(cur, table, dates, texts, where, params, total, missing_frac, mode)))
     findings += _guarded(con, "Correlations", "correlations", numeric_measures,
         lambda cur: _correlation_insights(cur, table, numeric_measures, where, params, missing_frac, mode))
     findings += _guarded(con, "Anomalies", "anomalies", numeric_measures,
@@ -820,12 +828,27 @@ def _concentration_insights(cur, table, texts, where, params, total, missing_fra
             continue
         ev_rows = _rowids(cur, table, where, params,
                           extra_sql=f"CAST({_qi(name)} AS VARCHAR) = ?", extra_params=[label])
+        # Runner-up for comparative context (Part 1): the next-biggest group and its
+        # real share, so "dominant" is grounded against the closest rival.
+        runner_clause, runner_metrics = ".", {}
+        top3 = cur.execute(
+            f"SELECT CAST({_qi(name)} AS VARCHAR) AS lab, COUNT(*) c FROM {_qi(table)}{where} "
+            f"GROUP BY lab ORDER BY c DESC LIMIT 3", params
+        ).fetchall()
+        runner = next(((lb, int(c)) for lb, c in top3 if lb is not None and lb != label), None)
+        if runner and total:
+            second, second_count = runner
+            share2 = second_count / total
+            runner_clause = f" — more than the next ('{second}', {share2*100:.0f}%)."
+            runner_metrics = {"runner_up": second, "runner_up_count": second_count,
+                              "runner_up_share_pct": round(share2 * 100, 2)}
         out.append(_insight(
             id=f"concentration_{name}", title=f"'{label}' dominates {name}",
             category="hidden_patterns",
             explanation=f"One group makes up a big share of {name} — '{label}' is "
-                        f"{share*100:.0f}% of all rows ({count:,} of {total:,}). Your overall "
-                        f"numbers mostly describe this group."
+                        f"{share*100:.0f}% of all rows ({count:,} of {total:,})"
+                        + runner_clause
+                        + " Your overall numbers mostly describe this group."
                         + ("" if total >= SMALL_SAMPLE else " With a small sample this may not hold.")
                         + _tech(mode, f" ({ndistinct} distinct values, share {share*100:.1f}%)"),
             why_it_matters=_why("concentration", mode, {"label": label, "col": name}),
@@ -833,7 +856,8 @@ def _concentration_insights(cur, table, texts, where, params, total, missing_fra
             trust_score=_trust(total, missing_frac.get(name, 0.0), share),
             evidence_rows=ev_rows, evidence_columns=[name],
             supporting_metrics={"column": name, "dominant_value": label, "count": count,
-                                "total": total, "share_pct": round(share * 100, 2)},
+                                "total": total, "share_pct": round(share * 100, 2),
+                                **runner_metrics},
             what_to_check_next=f"Break key metrics down by {name} to separate '{label}' from the rest.",
             notability=share,
         ))
@@ -922,6 +946,110 @@ def _trend_insights(cur, table, dates, numeric, where, params, total, missing_fr
                             "direction": direction},
         what_to_check_next=next_step,
         notability=r2,
+    )]
+
+
+# ---------------------------------------------------------------------------
+# Time-of-week / time-of-year rhythm (hidden pattern) — a "so what" interpretation.
+# ---------------------------------------------------------------------------
+
+def _time_pattern_insights(cur, table, dates, texts, where, params, total, missing_frac, mode) -> list[dict]:
+    """Busiest weekday (and, when the data spans months, the peak month + the
+    leading category's own peak day) — Parts 2 and 3.
+
+    Additive and deterministic: emits at most one 'hidden_patterns' card and only
+    when a usable date column exists AND the weekday distribution is genuinely
+    skewed (top weekday >= 1.3x an even 1/7 share). If the date column is missing,
+    the sample is tiny, or the distribution is flat, it emits nothing — never an
+    invented pattern. Nulls are excluded and timezone-aware values reduce to their
+    wall-clock timestamp (CAST AS TIMESTAMP), so the group-by is always well-typed.
+    """
+    if not dates:
+        return []
+    EVEN = 1.0 / 7.0
+    SKEW = 1.3  # top day must beat 1.3x an even day to count as a real rhythm
+    name = dates[0]
+    dident = _qi(name)
+    w = _augment(where, f"{dident} IS NOT NULL")
+
+    wd = cur.execute(
+        f"SELECT dayname(CAST({dident} AS TIMESTAMP)) AS d, COUNT(*) c "
+        f"FROM {_qi(table)}{w} GROUP BY d ORDER BY c DESC", params
+    ).fetchall()
+    n_dated = sum(int(r[1]) for r in wd)
+    if not wd or n_dated < SMALL_SAMPLE or wd[0][0] is None:
+        return []
+    top_wd, top_wd_c = wd[0][0], int(wd[0][1])
+    share = top_wd_c / n_dated
+    if share < SKEW * EVEN:
+        return []  # essentially flat across the week — invent nothing
+
+    # Optional peak month, only when the data actually spans >= 2 calendar months.
+    month_clause, peak_month = "", None
+    distinct_months = int(cur.execute(
+        f"SELECT COUNT(DISTINCT date_trunc('month', CAST({dident} AS TIMESTAMP))) "
+        f"FROM {_qi(table)}{w}", params
+    ).fetchone()[0] or 0)
+    if distinct_months >= 2:
+        mrow = cur.execute(
+            f"SELECT monthname(CAST({dident} AS TIMESTAMP)) AS m, COUNT(*) c "
+            f"FROM {_qi(table)}{w} GROUP BY m ORDER BY c DESC LIMIT 1", params
+        ).fetchone()
+        if mrow and mrow[0]:
+            peak_month = mrow[0]
+            month_clause = f" Activity peaks in {peak_month}."
+
+    # Optional category x weekday (Part 3): the leading category's own peak day,
+    # only if that category is itself clearly skewed toward one weekday.
+    cat_clause, cat_metrics = "", {}
+    if texts:
+        tcol = texts[0]
+        tid = _qi(tcol)
+        lead = cur.execute(
+            f"SELECT CAST({tid} AS VARCHAR) AS lab, COUNT(*) c FROM {_qi(table)}{w} "
+            f"GROUP BY lab ORDER BY c DESC LIMIT 1", params
+        ).fetchone()
+        if lead and lead[0] is not None:
+            lab = lead[0]
+            wc = _augment(w, f"CAST({tid} AS VARCHAR) = ?")
+            lwd = cur.execute(
+                f"SELECT dayname(CAST({dident} AS TIMESTAMP)) AS d, COUNT(*) c "
+                f"FROM {_qi(table)}{wc} GROUP BY d ORDER BY c DESC", [*params, lab]
+            ).fetchall()
+            n_lab = sum(int(r[1]) for r in lwd)
+            if lwd and n_lab >= SMALL_SAMPLE and lwd[0][0] is not None:
+                lab_wd, lab_wd_c = lwd[0][0], int(lwd[0][1])
+                if lab_wd_c / n_lab >= SKEW * EVEN:
+                    cat_clause = f" '{lab}' peaks on {lab_wd}s."
+                    cat_metrics = {"category_column": tcol, "leading_category": lab,
+                                   "category_peak_weekday": lab_wd}
+
+    ev_rows = _rowids(
+        cur, table, where, params,
+        extra_sql=f"{dident} IS NOT NULL AND dayname(CAST({dident} AS TIMESTAMP)) = ?",
+        extra_params=[top_wd],
+    )
+    # effect/consistency = how far the busiest day beats an even split (0 at the
+    # even line, 1 at double an even day). Scored with the shared helpers.
+    effect = max(0.0, min(1.0, share * 7.0 - 1.0))
+    return [_insight(
+        id="time_pattern", title=f"Busiest on {top_wd}s", category="hidden_patterns",
+        explanation=(f"You're busiest on {top_wd}s — about {share*100:.0f}% of all records, "
+                     f"noticeably above a typical day.")
+                    + month_clause + cat_clause
+                    + _tech(mode, f" (even day = {EVEN*100:.0f}%; {top_wd} = {share*100:.1f}%)"),
+        why_it_matters=_why("time_pattern", mode, {}),
+        confidence=_confidence(n_dated, effect),
+        trust_score=_trust(n_dated, missing_frac.get(name, 0.0), effect),
+        evidence_rows=ev_rows, evidence_columns=[name],
+        supporting_metrics={"date_column": name, "busiest_weekday": top_wd,
+                            "busiest_weekday_pct": round(share * 100, 2),
+                            "even_day_pct": round(EVEN * 100, 2),
+                            "weekday_counts": {str(d): int(c) for d, c in wd},
+                            "peak_month": peak_month, "dated_rows": n_dated,
+                            **cat_metrics},
+        what_to_check_next=f"Check whether the {top_wd} peak is real demand or a data artefact.",
+        notability=effect * 0.7,
     )]
 
 
@@ -1165,12 +1293,30 @@ def _what_changed_insights(cur, table, dates, texts, numeric, where, params, mis
             ev_rows = _rowids(cur, table, where, params,
                               extra_sql=f"CAST({gid} AS VARCHAR) = ?", extra_params=[top["label"]])
             effect = min(1.0, abs(top["delta"]) / base)
+            # Comparative "now the leader" framing (Part 1): rank groups by total
+            # volume across both halves. Only when the biggest MOVER is also the #1
+            # group overall do we name the runner-up and the gap — otherwise the
+            # "now the top" claim wouldn't be true.
+            totals = sorted(
+                ((int(first.get(lb, 0)) + int(second.get(lb, 0)), lb) for lb in labels),
+                key=lambda t: (t[0], str(t[1])), reverse=True,
+            )
+            lead_clause, lead_metrics = "", {}
+            leader_total, leader_label = totals[0]
+            second_total, second_label = totals[1]
+            if (leader_label == top["label"] and leader_label not in (None, "")
+                    and second_label not in (None, "") and second_total > 0):
+                lead_pct = (leader_total - second_total) / second_total * 100
+                lead_clause = f" It's now the top {dim}, {lead_pct:.0f}% ahead of '{second_label}'."
+                lead_metrics = {"leader_total": leader_total, "second_total": second_total,
+                                "second_label": second_label, "lead_pct": round(lead_pct, 2)}
             return [_insight(
                 id="what_changed", title=f"'{top['label']}' changed most in {dim}",
                 category="what_changed_most",
                 explanation=f"'{top['label']}' is the biggest mover in {dim} — it went from "
                             f"{top['first_half']:,} to {top['second_half']:,} ({pct:+.0f}%), the "
                             f"largest change of any {dim}."
+                            + lead_clause
                             + _tech(mode, f" ({top['delta']:+,} rows between the two halves)"),
                 why_it_matters=_why("what_changed", mode, {}),
                 confidence=_confidence(n_first + n_second, effect),
@@ -1178,7 +1324,8 @@ def _what_changed_insights(cur, table, dates, texts, numeric, where, params, mis
                 evidence_rows=ev_rows, evidence_columns=[date_col, dim],
                 supporting_metrics={"date_column": date_col, "dimension": dim,
                                     "midpoint": midpoint, "top_movers": movers[:6],
-                                    "first_half_rows": n_first, "second_half_rows": n_second},
+                                    "first_half_rows": n_first, "second_half_rows": n_second,
+                                    **lead_metrics},
                 what_to_check_next=f"Investigate what drove '{top['label']}' between the two halves.",
                 notability=effect,
             )]
