@@ -217,6 +217,16 @@ _LEAD_IN = {
     "researcher": "",
 }
 
+# The `explanation` always leads with plain meaning. For these two audiences we
+# append ONE short technical clause carrying the raw stat; everyone else sees the
+# plain sentence only. The full numbers always live in supporting_metrics too.
+_TECHNICAL_MODES = ("analyst", "researcher")
+
+
+def _tech(mode: str, clause: str) -> str:
+    """Return a short technical clause for analyst/researcher, '' for everyone else."""
+    return clause if mode in _TECHNICAL_MODES else ""
+
 
 def _why(category: str, mode: str, f: dict[str, Any]) -> str:
     """Audience-specific 'why it matters', formatted from computed facts ``f``."""
@@ -723,8 +733,9 @@ def _missing_insights(cur, table, columns, where, params, total, missing_by_colu
         worst_pct = worst[1]["missing_pct"] if worst else 0.0
         return [_insight(
             id="missing_data", title="No column is badly incomplete", category="missing_data",
-            explanation=f"No column exceeds the {int(MISSING_FLAG*100)}% missing-value "
-                        f"threshold; the most incomplete column is {worst_pct}% missing.",
+            explanation=f"Your data is fairly complete — no column has a lot of blanks. "
+                        f"The gappiest one is only {worst_pct}% empty."
+                        + _tech(mode, f" (flag threshold {int(MISSING_FLAG*100)}%)"),
             why_it_matters=_why("missing_data", mode, {}),
             confidence=_confidence(total, 0.5), trust_score=_trust(total, 0.0, 1.0),
             evidence_columns=list(missing_by_column.keys()),
@@ -744,10 +755,11 @@ def _missing_insights(cur, table, columns, where, params, total, missing_by_colu
     return [_insight(
         id="missing_data", title=f"{len(flagged)} column(s) have heavy missing data",
         category="missing_data",
-        explanation=f"{worst_col} is missing {flagged[worst_col]['missing_pct']}% of its "
-                    f"values; {len(flagged)} column(s) exceed the {int(MISSING_FLAG*100)}% "
-                    f"threshold. Metrics built on these columns are only partly evidenced."
-                    + ("" if total >= SMALL_SAMPLE else " Sample is small, so treat this as directional."),
+        explanation=f"Some columns have a lot of blanks — {worst_col} is missing "
+                    f"{flagged[worst_col]['missing_pct']}% of its values, so any number "
+                    f"based on {worst_col} is only partly backed by real data."
+                    + ("" if total >= SMALL_SAMPLE else " Sample is small, so treat this as directional.")
+                    + _tech(mode, f" ({len(flagged)} column(s) over the {int(MISSING_FLAG*100)}% mark)"),
         why_it_matters=_why("missing_data", mode, {}),
         confidence=_confidence(total, min(1.0, worst_frac / MISSING_FLAG)),
         trust_score=_trust(total, 0.0, 1.0),  # this IS the data-quality claim; report it at full consistency
@@ -811,9 +823,11 @@ def _concentration_insights(cur, table, texts, where, params, total, missing_fra
         out.append(_insight(
             id=f"concentration_{name}", title=f"'{label}' dominates {name}",
             category="hidden_patterns",
-            explanation=f"In {name}, '{label}' accounts for {count:,} of {total:,} rows "
-                        f"({share*100:.1f}%). Aggregate numbers are largely describing this group."
-                        + ("" if total >= SMALL_SAMPLE else " With a small sample this may not hold."),
+            explanation=f"One group makes up a big share of {name} — '{label}' is "
+                        f"{share*100:.0f}% of all rows ({count:,} of {total:,}). Your overall "
+                        f"numbers mostly describe this group."
+                        + ("" if total >= SMALL_SAMPLE else " With a small sample this may not hold.")
+                        + _tech(mode, f" ({ndistinct} distinct values, share {share*100:.1f}%)"),
             why_it_matters=_why("concentration", mode, {"label": label, "col": name}),
             confidence=_confidence(total, share),
             trust_score=_trust(total, missing_frac.get(name, 0.0), share),
@@ -873,18 +887,22 @@ def _trend_insights(cur, table, dates, numeric, where, params, total, missing_fr
     # trend — say "No clear trend over time" and don't claim a direction.
     slope_disp = round(float(slope), 2)
     trend_clear = (r2 >= STRONG_CORR) and (abs(slope_disp) > 0)
+    # "very consistent"/"fairly consistent"/"rough" from how well the trend holds.
+    steadiness = ("very consistent" if r2 >= 0.8
+                  else "fairly consistent" if r2 >= 0.5 else "rough")
     if trend_clear:
         direction = "increasing" if slope > 0 else "decreasing"
+        trend_word = "rising" if slope > 0 else "falling"
         title = f"Row volume is {direction} over time"
-        trend_phrase = f"a {direction} trend"
+        plain = (f"Your {name} activity is {trend_word} over time — daily records went "
+                 f"from about {first_c:,} to {last_c:,}. It's a {steadiness} trend.")
         next_step = f"Check whether the {direction} trend in {name} is seasonal or a real shift."
-        note = ""
     else:
         direction = "flat"
         title = "No clear trend over time"
-        trend_phrase = "no clear trend"
+        plain = (f"Your {name} activity is roughly flat over time — daily records went "
+                 f"from about {first_c:,} to {last_c:,}, with no clear direction.")
         next_step = f"Look for seasonality or segment-level movement in {name}; the overall line is flat/noisy."
-        note = " The slope is negligible or R² is below 0.30, so no direction is reliable."
 
     # evidence: earliest and latest rows in time
     ev_rows = (_rowids(cur, table, where, params, extra_sql=f"{ident} IS NOT NULL",
@@ -893,9 +911,7 @@ def _trend_insights(cur, table, dates, numeric, where, params, total, missing_fr
                          order_by=f"{ident} DESC", limit=5))
     return [_insight(
         id="trend", title=title, category="hidden_patterns",
-        explanation=f"Fitting a line to daily counts over {name} shows {trend_phrase} "
-                    f"(slope {slope:+.2f} rows/day, R²={r2:.2f}). First bucket {first_c:,} → "
-                    f"last bucket {last_c:,}." + note,
+        explanation=plain + _tech(mode, f" (slope {slope:+.2f}/day, R²={r2:.2f})"),
         why_it_matters=_why("trend", mode, {}),
         confidence=_confidence(total, r2),
         trust_score=_trust(total, missing_frac.get(name, 0.0), r2),
@@ -954,11 +970,12 @@ def _correlation_insights(cur, table, numeric, where, params, missing_frac, mode
     relation, strength = _corr_relation(r)
     ar = abs(r)
     if ar < WEAK_CORR:
-        caveat = " In practice these two are effectively unrelated."
-    elif ar < MODERATE_CORR:
-        caveat = " The relationship is weak, so treat it cautiously."
+        plain = (f"{a} and {b} don't really move together — knowing one tells you "
+                 f"little about the other.")
     else:
-        caveat = ""
+        move = "up too" if r >= 0 else "down"
+        plain = (f"When {a} goes up, {b} usually goes {move}. It's a {strength} "
+                 f"pattern, not proof that one causes the other.")
     ia = _qi(a)
     # evidence: a few lowest-a and highest-a rows (both cols present) to show co-movement
     cond = f"{ia} IS NOT NULL AND {_qi(b)} IS NOT NULL"
@@ -968,9 +985,7 @@ def _correlation_insights(cur, table, numeric, where, params, missing_frac, mode
     return [_insight(
         id="correlation_top", title=f"{a} and {b} are {relation}",
         category="correlations",
-        explanation=f"Pearson r = {r:+.2f} between {a} and {b} over n={n:,} paired rows "
-                    f"(r²={r*r:.2f}). This is a {strength} linear relationship; it is "
-                    f"association, not proof of causation." + caveat,
+        explanation=plain + _tech(mode, f" (r={r:+.2f}, r²={r*r:.2f}, n={n:,})"),
         why_it_matters=_why("correlation", mode, {}),
         confidence=_confidence(n, ar),
         trust_score=_trust(n, (missing_frac.get(a, 0.0) + missing_frac.get(b, 0.0)) / 2, ar),
@@ -1027,8 +1042,9 @@ def _anomaly_insights(cur, table, numeric, where, params, total, missing_frac, m
     if not candidates:
         return [_insight(
             id="anomalies", title="No IQR outliers found", category="anomalies",
-            explanation="No numeric column has values beyond the 1.5×IQR fence — the numeric "
-                        "data is well-behaved.",
+            explanation="Your numbers are well-behaved — no value stands out as an extreme "
+                        "compared with the rest of its column."
+                        + _tech(mode, f" (checked {len(numeric)} numeric column(s))"),
             why_it_matters=_why("anomalies", mode, {}),
             confidence=_confidence(total, 0.5), trust_score=_trust(total, 0.0, 1.0),
             evidence_columns=numeric,
@@ -1054,10 +1070,11 @@ def _anomaly_insights(cur, table, numeric, where, params, total, missing_frac, m
         out.append(_insight(
             id=f"anomaly_{name}", title=f"{c['n_out']:,} outlier row(s) in {name}",
             category="anomalies",
-            explanation=f"{name} has {c['n_out']:,} of {c['cnt']:,} values ({c['frac']*100:.1f}%) "
-                        f"outside the 1.5×IQR fence [{_round(c['lo'],2)}, {_round(c['hi'],2)}] "
-                        f"(Q1={_round(c['q1'],2)}, Q3={_round(c['q3'],2)}). Extremes range "
-                        f"{_round(mn_out,2)}–{_round(mx_out,2)}.",
+            explanation=f"{c['n_out']:,} value(s) in {name} stand out far from the rest — "
+                        f"they range {_round(mn_out,2)}–{_round(mx_out,2)}, while most sit "
+                        f"between {_round(c['q1'],2)} and {_round(c['q3'],2)}."
+                        + _tech(mode, f" ({c['frac']*100:.1f}% fall outside "
+                                      f"[{_round(c['lo'],2)}, {_round(c['hi'],2)}])"),
             why_it_matters=_why("anomalies", mode, {}),
             confidence=_confidence(c["cnt"], effect),
             trust_score=_trust(c["cnt"], missing_frac.get(name, 0.0), consistency),
@@ -1151,10 +1168,10 @@ def _what_changed_insights(cur, table, dates, texts, numeric, where, params, mis
             return [_insight(
                 id="what_changed", title=f"'{top['label']}' changed most in {dim}",
                 category="what_changed_most",
-                explanation=f"Splitting {date_col} at its midpoint, '{top['label']}' in {dim} went "
-                            f"from {top['first_half']:,} to {top['second_half']:,} rows "
-                            f"({top['delta']:+,}, {pct:+.0f}%) — the biggest mover across "
-                            f"{len(labels)} groups.",
+                explanation=f"'{top['label']}' is the biggest mover in {dim} — it went from "
+                            f"{top['first_half']:,} to {top['second_half']:,} ({pct:+.0f}%), the "
+                            f"largest change of any {dim}."
+                            + _tech(mode, f" ({top['delta']:+,} rows between the two halves)"),
                 why_it_matters=_why("what_changed", mode, {}),
                 confidence=_confidence(n_first + n_second, effect),
                 trust_score=_trust(n_first + n_second, missing_frac.get(dim, 0.0), min(1.0, effect + 0.2)),
@@ -1179,8 +1196,9 @@ def _what_changed_insights(cur, table, dates, texts, numeric, where, params, mis
     return [_insight(
         id="what_changed", title="Overall volume shifted between halves",
         category="what_changed_most",
-        explanation=f"Row volume went from {n_first:,} (earlier half) to {n_second:,} (later "
-                    f"half), a change of {delta:+,} ({100*delta/base:+.0f}%).",
+        explanation=f"You have {'more' if delta > 0 else 'less'} data in the later half — "
+                    f"records went from {n_first:,} to {n_second:,}, {100*delta/base:+.0f}%."
+                    + _tech(mode, f" ({delta:+,} rows between halves)"),
         why_it_matters=_why("what_changed", mode, {}),
         confidence=_confidence(n_first + n_second, effect),
         trust_score=_trust(n_first + n_second, missing_frac.get(date_col, 0.0), min(1.0, effect + 0.2)),
