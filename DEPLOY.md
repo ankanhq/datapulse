@@ -46,7 +46,7 @@ Verify: open `https://YOUR-API.onrender.com/` — you should see
 > Free Render services spin down when idle, so the first request after a while
 > takes ~30–60 s to cold-start.
 
-Record the backend URL, e.g. `https://datapulse-api.onrender.com`.
+Record the backend URL, e.g. `https://datapulse-api-gm5r.onrender.com`.
 
 ---
 
@@ -61,7 +61,7 @@ The frontend reads its API base URL from `VITE_API_BASE` at **build time**.
 
    | Key             | Value                                |
    |-----------------|--------------------------------------|
-   | `VITE_API_BASE` | `https://datapulse-api.onrender.com` |
+   | `VITE_API_BASE` | `https://datapulse-api-gm5r.onrender.com` |
 
    Use your real Render URL from Part 1, **no trailing slash**.
 4. **Deploy.**
