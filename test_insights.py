@@ -12,6 +12,7 @@ Run:  pytest -q   (from the backend repo root)
 """
 
 import os
+import re
 import tempfile
 import time
 
@@ -341,6 +342,70 @@ def test_flat_weekday_emits_no_time_pattern():
     ds = _paste("\n".join(lines), name="flat_week")
     insights = client.get(f"/datasets/{ds}/insights").json()["insights"]
     assert not any(i["id"] == "time_pattern" for i in insights)
+
+
+# --------------------------------------------------------------------------
+# Plain-language "key takeaways" digest (additive top-level field).
+# --------------------------------------------------------------------------
+
+# Terms that must never leak into a plain-language takeaway, even in analyst mode
+# (which appends a technical "(slope … R²…)" clause to explanation).
+_DIGEST_BANNED = ("slope", "R²", "R^2", "IQR", "Pearson")
+
+
+def test_key_takeaways_digest_is_clean(tmp_path):
+    import generate_data
+
+    p = tmp_path / "story.csv"
+    generate_data.generate_story(str(p), days=180, seed=7)
+    ds = _paste(p.read_text(), name="story")
+    # Analyst mode is the strict case: explanations carry a trailing technical
+    # clause, and the digest must strip it.
+    rep = client.get(f"/datasets/{ds}/insights", params={"mode": "analyst"}).json()
+
+    assert "key_takeaways" in rep
+    kts = rep["key_takeaways"]
+    assert 0 < len(kts) <= 3, "story sample should yield a non-empty digest"
+
+    report_ids = {i["id"] for i in rep["insights"]}
+    for kt in kts:
+        assert {"rank", "source_insight", "text"} <= set(kt)
+        assert isinstance(kt["rank"], int) and isinstance(kt["source_insight"], str)
+        assert kt["source_insight"] in report_ids
+        text = kt["text"]
+        assert text and isinstance(text, str)
+        assert "\n" not in text, "each takeaway must be a single line"
+        for word in _DIGEST_BANNED:
+            assert word not in text, f"digest leaked {word!r}: {text!r}"
+        # no trailing "(...)" technical parenthetical survived the strip
+        assert not re.search(r"\([^()]*\)\s*$", text), f"digest kept a trailing clause: {text!r}"
+    # ranks are 1..n, in order
+    assert [k["rank"] for k in kts] == list(range(1, len(kts) + 1))
+
+
+def test_key_takeaways_matches_across_modes(tmp_path):
+    # The digest is the plain meaning, so it must be identical regardless of the
+    # audience mode (which only changes the technical clause we strip off).
+    import generate_data
+
+    p = tmp_path / "story.csv"
+    generate_data.generate_story(str(p), days=180, seed=7)
+    ds = _paste(p.read_text(), name="story")
+    a = client.get(f"/datasets/{ds}/insights", params={"mode": "founder"}).json()["key_takeaways"]
+    b = client.get(f"/datasets/{ds}/insights", params={"mode": "analyst"}).json()["key_takeaways"]
+    assert a and a == b
+
+
+def test_key_takeaways_empty_when_no_strong_pattern():
+    # Uniform-random data has no strong finding -> the honest "no strong patterns"
+    # path fires and the digest is empty (the frontend hides the block).
+    import random
+
+    random.seed(11)
+    rows = ["a,b"] + [f"{random.random():.3f},{random.random():.3f}" for _ in range(15)]
+    ds = _paste("\n".join(rows))
+    rep = client.get(f"/datasets/{ds}/insights").json()
+    assert rep["key_takeaways"] == []
 
 
 def test_small_sample_flagged_and_limitations_honest():

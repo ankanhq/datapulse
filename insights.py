@@ -382,6 +382,22 @@ def _guarded(con, name: str, category: str, cols_hint, fn) -> list[dict]:
         return [_limitation(name, category, cols_hint, f"could not be computed ({type(exc).__name__})")]
 
 
+def _digest_text(explanation: str) -> str:
+    """One clean, non-technical line from an insight's explanation, for the
+    key-takeaways digest.
+
+    Two steps, mirroring the frontend's ``splitTakeaway``:
+    1. strip a single trailing technical parenthetical (the analyst/researcher
+       "(slope … R²…)" clause) so the digest never leaks stats regardless of mode;
+    2. keep only the first sentence so each takeaway reads as one line.
+
+    The sentence split cuts at a terminator followed by whitespace, so decimals
+    like ``500000.0`` (a '.' followed by a digit, not a space) are never split.
+    """
+    text = re.sub(r"\s*\([^()]*\)\s*$", "", explanation or "").strip()
+    return re.split(r"(?<=[.!?])\s+", text, maxsplit=1)[0].strip()
+
+
 # ---------------------------------------------------------------------------
 # Main entry point.
 # ---------------------------------------------------------------------------
@@ -530,6 +546,10 @@ def _compute(con, table, columns, where, params, mode, numeric, dates, texts, al
     # and if there aren't at least two genuinely strong findings, don't pad the
     # section — say so honestly. Low-trust items still live in their detailed
     # sections below (they're all appended to `insights` afterwards).
+    # Plain-language digest of the same headline findings (purely additive: no
+    # scores/ranking/fields change). Populated only when there ARE strong findings;
+    # the honest "no strong patterns" path leaves it [] so the frontend hides it.
+    key_takeaways: list[dict] = []
     try:
         # Eligible = real findings only: not a limitation, trust above the floor,
         # and a non-zero effect size. The effect-size gate is what makes
@@ -551,6 +571,8 @@ def _compute(con, table, columns, where, params, mode, numeric, dates, texts, al
                 top["supporting_metrics"] = {"rank": rank, "source_insight": src["id"],
                                              **src["supporting_metrics"]}
                 insights.append(top)
+                key_takeaways.append({"rank": rank, "source_insight": src["id"],
+                                      "text": _digest_text(src["explanation"])})
         else:
             insights.append(_insight(
                 id="top_insights_none",
@@ -570,6 +592,7 @@ def _compute(con, table, columns, where, params, mode, numeric, dates, texts, al
             ))
     except Exception as exc:  # noqa: BLE001
         log.warning("insights: ranking top insights failed: %r", exc)
+        key_takeaways = []  # degrade to empty rather than break the report
 
     insights += findings
 
@@ -583,6 +606,7 @@ def _compute(con, table, columns, where, params, mode, numeric, dates, texts, al
         "summary": summary,
         "data_quality": data_quality,
         "insights": insights,
+        "key_takeaways": key_takeaways,
         "follow_up_questions": follow_ups,
     }
 
@@ -616,6 +640,9 @@ def _exec_card(cur, table, where, params, mode, total, all_names, numeric, dates
 
 def _finalize(report: dict) -> dict:
     """Strip internal-only fields before returning to the client."""
+    # Guarantee the additive digest key exists on every report shape (the total==0
+    # and catastrophic-fallback paths don't build one) so the response is uniform.
+    report.setdefault("key_takeaways", [])
     for ins in report.get("insights", []):
         ins.pop("_notability", None)
     return report
