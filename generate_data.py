@@ -28,11 +28,11 @@ REGIONS = ["North", "South", "East", "West", "Central"]
 PRODUCT_LINES = ["Alpha", "Bravo", "Charlie", "Delta"]
 
 # Multiplier applied to a Wednesday's row count in the "story" profile so the
-# bundled sample has a clear busiest-weekday pattern (~35% of rows fall on
+# bundled sample has a clear busiest-weekday pattern (~30% of rows fall on
 # Wednesdays, so "You're busiest on Wednesdays" fires). Tuned empirically; the
 # daily-volume trend stays directional ("increasing over time") but is naturally
 # less certain, since a real weekly cycle rides on top of the ramp.
-WEDNESDAY_FACTOR = 3.2
+WEDNESDAY_FACTOR = 2.5
 
 
 def generate(path: str, total_rows: int, chunk_size: int, seed: int) -> None:
