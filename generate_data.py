@@ -27,6 +27,13 @@ REGIONS = ["North", "South", "East", "West", "Central"]
 # Evidence Mode surfaces a strong concentration insight.
 PRODUCT_LINES = ["Alpha", "Bravo", "Charlie", "Delta"]
 
+# Multiplier applied to a Wednesday's row count in the "story" profile so the
+# bundled sample has a clear busiest-weekday pattern (~35% of rows fall on
+# Wednesdays, so "You're busiest on Wednesdays" fires). Tuned empirically; the
+# daily-volume trend stays directional ("increasing over time") but is naturally
+# less certain, since a real weekly cycle rides on top of the ramp.
+WEDNESDAY_FACTOR = 3.2
+
 
 def generate(path: str, total_rows: int, chunk_size: int, seed: int) -> None:
     rng = np.random.default_rng(seed)
@@ -115,9 +122,16 @@ def generate_story(path: str, days: int, seed: int) -> None:
     others = np.array([p for p in PRODUCT_LINES if p != "Alpha"])
 
     for d in range(days):
+        day = start + timedelta(days=d)
         # Daily row volume ramps up smoothly over time -> high-R² trend card.
         n = max(1, int(round(6 + 0.20 * d + rng.normal(0, 1.2))))
-        day_str = (start + timedelta(days=d)).isoformat()
+        # Weekday skew: Wednesdays carry a heavier share of activity so the
+        # "You're busiest on Wednesdays" pattern fires on the bundled sample.
+        # The multiplier scales with the daily ramp, so the long-run upward trend
+        # is preserved (the weekly bump rides on top of it).
+        if day.weekday() == 2:  # Wednesday
+            n = max(1, int(round(n * WEDNESDAY_FACTOR)))
+        day_str = day.isoformat()
 
         # 'Alpha' dominates (~65%); the rest split across the other lines.
         is_alpha = rng.random(n) < 0.65

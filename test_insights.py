@@ -408,6 +408,132 @@ def test_key_takeaways_empty_when_no_strong_pattern():
     assert rep["key_takeaways"] == []
 
 
+# --------------------------------------------------------------------------
+# Copy polish: number formatting, pluralization, outlier phrasing, multiples,
+# rare-but-real, generic date wording.
+# --------------------------------------------------------------------------
+
+def _multi_outlier_csv():
+    """60 tightly-clustered values plus 3 huge extremes -> a multi-outlier card
+    whose numbers exercise thousands separators."""
+    lines = ["id,v"]
+    for i in range(60):
+        lines.append(f"{i},{100 + i % 5}")
+    for j, val in enumerate([9000, 9500, 10000]):
+        lines.append(f"{200 + j},{val}")
+    return "\n".join(lines)
+
+
+def _big_lead_csv():
+    """'Alpha' both surges most AND towers over 'Beta' overall, so the leader gap
+    exceeds 200% and must read as a multiple ('about 9× ahead')."""
+    import datetime as _dt
+
+    lines = ["date,product"]
+    start = _dt.date(2026, 1, 5)
+    for wk in range(8):
+        for dow in range(7):
+            d = start + _dt.timedelta(days=wk * 7 + dow)
+            for _ in range(3 if wk < 4 else 15):
+                lines.append(f"{d.isoformat()},Alpha")
+            lines.append(f"{d.isoformat()},Beta")
+    return "\n".join(lines)
+
+
+def _renamed_date_trend_csv():
+    """A ramping daily volume over a date column NOT named 'date' (here 'day')."""
+    import datetime as _dt
+
+    start = _dt.date(2026, 1, 1)
+    lines = ["day,v"]
+    for d in range(60):
+        day = (start + _dt.timedelta(days=d)).isoformat()
+        for _ in range(max(1, int(2 + 0.5 * d))):
+            lines.append(f"{day},{d}")
+    return "\n".join(lines)
+
+
+def test_number_formatting_and_no_pluralize_on_story(tmp_path):
+    # Analyst mode is strictest: explanations also carry the technical clause.
+    import generate_data
+
+    p = tmp_path / "story.csv"
+    generate_data.generate_story(str(p), days=180, seed=7)
+    ds = _paste(p.read_text(), name="story")
+    rep = client.get(f"/datasets/{ds}/insights", params={"mode": "analyst"}).json()
+
+    saw_grouped = False
+    for ins in rep["insights"]:
+        for field in (ins["title"], ins["explanation"]):
+            assert "(s)" not in field, f"pluralize marker leaked: {field!r}"
+            # the raw float that motivated _fmt must never reach the copy
+            assert "500000.0" not in field, f"unformatted number leaked: {field!r}"
+            if re.search(r"\d{1,3},\d{3}", field):
+                saw_grouped = True
+    # the story sample has thousands-scale counts, so at least one card must show
+    # a thousands-separated number — proof _fmt is actually applied.
+    assert saw_grouped, "expected a thousands-separated number somewhere in the copy"
+
+    # the digest is built from explanations, so it inherits the formatting.
+    for kt in rep["key_takeaways"]:
+        assert "500000.0" not in kt["text"]
+        assert "(s)" not in kt["text"]
+
+
+def test_single_outlier_phrasing():
+    ds = _paste(_synthetic_csv())
+    ins = client.get(f"/datasets/{ds}/insights").json()["insights"]
+    an = next(i for i in ins if i["id"] == "anomaly_y")
+    assert an["title"] == "1 outlier row in y"          # no "(s)", singular
+    assert an["supporting_metrics"]["outlier_count"] == 1
+    # one value: stated directly, never "they range X–X"
+    assert "One value" in an["explanation"]
+    assert "they range" not in an["explanation"]
+    assert "stands far above the rest" in an["explanation"]
+    assert "1,000" in an["explanation"]                 # thousands separator
+
+
+def test_multiple_outliers_keep_a_range():
+    ds = _paste(_multi_outlier_csv())
+    ins = client.get(f"/datasets/{ds}/insights").json()["insights"]
+    an = next(i for i in ins if i["id"] == "anomaly_v")
+    assert an["title"] == "3 outlier rows in v"          # no "(s)", plural
+    assert an["supporting_metrics"]["outlier_count"] == 3
+    # multiple outliers keep a range, formatted with thousands separators
+    assert "they range" in an["explanation"]
+    assert "9,000 to 10,000" in an["explanation"]
+
+
+def test_big_lead_reads_as_a_multiple():
+    ds = _paste(_big_lead_csv())
+    ins = client.get(f"/datasets/{ds}/insights", params={"mode": "founder"}).json()["insights"]
+    wc = next(i for i in ins if i["id"] == "what_changed")
+    lead_pct = wc["supporting_metrics"]["lead_pct"]
+    assert lead_pct > 200                                # exact percent kept in metrics
+    assert "× ahead of" in wc["explanation"]             # rendered as a multiple
+    # the raw ">200%" figure must NOT appear as the lead in the copy
+    assert f"{round(lead_pct)}% ahead" not in wc["explanation"]
+
+
+def test_generic_date_column_wording(tmp_path):
+    import generate_data
+
+    # Column literally named "date": neutral subject, not "Your date activity".
+    p = tmp_path / "story.csv"
+    generate_data.generate_story(str(p), days=180, seed=7)
+    ds = _paste(p.read_text(), name="story")
+    ins = client.get(f"/datasets/{ds}/insights").json()["insights"]
+    trend = next(i for i in ins if i["id"] == "trend")
+    assert "Activity in this data" in trend["explanation"]
+    assert "Your date activity" not in trend["explanation"]
+
+    # A differently-named date column keeps the possessive "Your {name} activity".
+    ds2 = _paste(_renamed_date_trend_csv(), name="renamed_date")
+    ins2 = client.get(f"/datasets/{ds2}/insights").json()["insights"]
+    trend2 = next(i for i in ins2 if i["id"] == "trend")
+    assert "Your day activity" in trend2["explanation"]
+
+
 def test_small_sample_flagged_and_limitations_honest():
     # 3 rows; floats so a/b read as measurements (integer sequences would now be
     # flagged as identifiers and excluded, leaving no column to decline on).
@@ -547,7 +673,8 @@ def test_endpoint_returns_200_even_if_a_section_raises(monkeypatch):
 
 def test_story_sample_shows_strong_evidence_cards(tmp_path):
     # The built-in "story" sample must produce strong cards on first click:
-    # a confident volume trend, a dominant category, and one obvious outlier.
+    # an upward volume trend, a busiest-weekday pattern, a dominant category, and
+    # one obvious outlier.
     import generate_data
 
     p = tmp_path / "story.csv"
@@ -559,8 +686,21 @@ def test_story_sample_shows_strong_evidence_cards(tmp_path):
     hidden = [i for i in real if i["category"] == "hidden_patterns"]
     anomalies = [i for i in real if i["category"] == "anomalies"]
 
+    # The weekday skew (WEDNESDAY_FACTOR) honestly lowers the daily-count trend R²,
+    # so the trend is no longer "very consistent" — but it is still a real, upward
+    # DIRECTION. Assert direction + a non-zero confidence, not a high R².
     trend = [i for i in hidden if "over time" in i["title"]]
-    assert trend and trend[0]["confidence"] >= 0.7, "expected a confident trend card"
+    assert trend, "expected a trend card"
+    assert trend[0]["supporting_metrics"]["direction"] == "increasing"
+    assert trend[0]["confidence"] > 0, "the upward trend should carry some confidence"
+    assert "increasing" in trend[0]["title"]
+
+    # ...and that skew must surface as a confident busiest-weekday insight.
+    weekday = [i for i in hidden if i["id"] == "time_pattern"]
+    assert weekday and not weekday[0].get("is_limitation"), "expected a busiest-weekday insight"
+    assert weekday[0]["supporting_metrics"]["busiest_weekday"] == "Wednesday"
+    assert weekday[0]["confidence"] >= 0.7, "the Wednesday skew should read as high-confidence"
+    assert "Wednesday" in weekday[0]["explanation"]
 
     concentration = [i for i in hidden if "dominates" in i["title"]]
     assert concentration and concentration[0]["confidence"] >= 0.4, "expected a dominant-category card"
@@ -568,6 +708,9 @@ def test_story_sample_shows_strong_evidence_cards(tmp_path):
     outlier = [i for i in anomalies if "outlier" in i["title"] and "revenue" in i["title"]]
     assert outlier, "expected an outlier card on revenue"
     assert outlier[0]["supporting_metrics"]["outlier_count"] == 1, "expected exactly one obvious outlier"
+    # A single, high-trust extreme must be flagged rare-but-real (not "probably wrong").
+    assert outlier[0]["supporting_metrics"].get("rare_but_real") is True
+    assert "clearly far outside the normal range" in outlier[0]["explanation"]
 
 
 def test_chart_time_series_split_by(tmp_path):

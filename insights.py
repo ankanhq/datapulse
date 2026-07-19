@@ -117,6 +117,47 @@ def _round(x: Any, n: int = 4) -> Any:
         return x
 
 
+def _fmt(x: Any) -> str:
+    """Human-friendly number for user-facing copy: thousands separators, and
+    decimals kept only when they carry meaning.
+
+    500000.0 -> "500,000"; 2346.05 -> "2,346"; 34.493 -> "34.49"; 0.05 -> "0.05".
+    Whole values and large magnitudes print without a decimal tail; only smaller
+    values (where a fraction is informative, e.g. an average) keep decimals.
+    Non-numbers pass through as ``str``. Raw values in supporting_metrics are
+    never routed through this — it is presentation only.
+    """
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return str(x)
+    if v != v or v in (float("inf"), float("-inf")):  # NaN / inf -> leave as-is
+        return str(x)
+    if v == int(v):
+        return f"{int(v):,}"
+    av = abs(v)
+    if av >= 100:            # large magnitude: a decimal tail is just noise
+        return f"{round(v):,}"
+    if av >= 1:             # keep up to 2 dp, trim trailing zeros
+        return f"{v:,.2f}".rstrip("0").rstrip(".")
+    return f"{v:,.4f}".rstrip("0").rstrip(".")   # < 1: keep more precision
+
+
+def _multiple_phrase(pct: float) -> str:
+    """A big percentage lead/change (meant for >200%) as a human multiple.
+
+    A "466% ahead" gap means the leader is 1 + 4.66 = 5.66× the runner-up; this
+    renders it to the nearest half-multiple with an honest hedge word, e.g.
+    "almost 6×" / "about 3.5×". The exact percentage always stays in
+    supporting_metrics — this is copy only.
+    """
+    ratio = 1.0 + abs(pct) / 100.0
+    r = round(ratio * 2) / 2.0            # nearest 0.5
+    approx = "almost" if ratio < r else "about"
+    num = f"{r:.1f}".rstrip("0").rstrip(".")
+    return f"{approx} {num}×"
+
+
 def _sample_weight(n: int) -> float:
     return min(1.0, n / FULL_SAMPLE)
 
@@ -618,11 +659,11 @@ def _exec_card(cur, table, where, params, mode, total, all_names, numeric, dates
     return _insight(
         id="executive_summary", title="What this dataset is", category="executive_summary",
         explanation=_LEAD_IN[mode] + (
-            f"This dataset has {total:,} rows and {len(all_names)} columns "
-            f"({len(numeric)} numeric, {len(dates)} date, {len(texts)} text)."
+            f"This dataset has {_fmt(total)} rows and {_fmt(len(all_names))} columns "
+            f"({_fmt(len(numeric))} numeric, {_fmt(len(dates))} date, {_fmt(len(texts))} text)."
             + (f" It spans {facts_exec['date_span']}." if facts_exec.get("date_span") else "")
             + ("" if total >= SMALL_SAMPLE else
-               f" Note: with only {total} rows, confidence is limited.")
+               f" Note: with only {_fmt(total)} rows, confidence is limited.")
         ),
         why_it_matters=_why("executive_summary", mode, facts_exec),
         confidence=_confidence(total, 1.0),
@@ -787,14 +828,18 @@ def _missing_insights(cur, table, columns, where, params, total, missing_by_colu
              if missing_by_column[worst_col]["type"] == "text" else f"{ident} IS NULL")
     ev_rows = _rowids(cur, table, where, params, extra_sql=extra)
     worst_frac = flagged[worst_col]["missing_fraction"]
+    n_flagged = len(flagged)
+    col_word, col_verb = ("column", "has") if n_flagged == 1 else ("columns", "have")
+    lead = (f"One column has a lot of blanks" if n_flagged == 1
+            else "Some columns have a lot of blanks")
     return [_insight(
-        id="missing_data", title=f"{len(flagged)} column(s) have heavy missing data",
+        id="missing_data", title=f"{_fmt(n_flagged)} {col_word} {col_verb} heavy missing data",
         category="missing_data",
-        explanation=f"Some columns have a lot of blanks — {worst_col} is missing "
+        explanation=f"{lead} — {worst_col} is missing "
                     f"{flagged[worst_col]['missing_pct']}% of its values, so any number "
                     f"based on {worst_col} is only partly backed by real data."
                     + ("" if total >= SMALL_SAMPLE else " Sample is small, so treat this as directional.")
-                    + _tech(mode, f" ({len(flagged)} column(s) over the {int(MISSING_FLAG*100)}% mark)"),
+                    + _tech(mode, f" ({_fmt(n_flagged)} {col_word} over the {int(MISSING_FLAG*100)}% mark)"),
         why_it_matters=_why("missing_data", mode, {}),
         confidence=_confidence(total, min(1.0, worst_frac / MISSING_FLAG)),
         trust_score=_trust(total, 0.0, 1.0),  # this IS the data-quality claim; report it at full consistency
@@ -873,7 +918,7 @@ def _concentration_insights(cur, table, texts, where, params, total, missing_fra
             id=f"concentration_{name}", title=f"'{label}' dominates {name}",
             category="hidden_patterns",
             explanation=f"One group makes up a big share of {name} — '{label}' is "
-                        f"{share*100:.0f}% of all rows ({count:,} of {total:,})"
+                        f"{share*100:.0f}% of all rows ({_fmt(count)} of {_fmt(total)})"
                         + runner_clause
                         + " Your overall numbers mostly describe this group."
                         + ("" if total >= SMALL_SAMPLE else " With a small sample this may not hold.")
@@ -941,18 +986,21 @@ def _trend_insights(cur, table, dates, numeric, where, params, total, missing_fr
     # "very consistent"/"fairly consistent"/"rough" from how well the trend holds.
     steadiness = ("very consistent" if r2 >= 0.8
                   else "fairly consistent" if r2 >= 0.5 else "rough")
+    # A column literally named "date" reads oddly as "Your date activity is
+    # rising" (sounds like dating), so use a neutral subject for it.
+    subject = "Activity in this data" if name == "date" else f"Your {name} activity"
     if trend_clear:
         direction = "increasing" if slope > 0 else "decreasing"
         trend_word = "rising" if slope > 0 else "falling"
         title = f"Row volume is {direction} over time"
-        plain = (f"Your {name} activity is {trend_word} over time — daily records went "
-                 f"from about {first_c:,} to {last_c:,}. It's a {steadiness} trend.")
+        plain = (f"{subject} is {trend_word} over time — daily records went "
+                 f"from about {_fmt(first_c)} to {_fmt(last_c)}. It's a {steadiness} trend.")
         next_step = f"Check whether the {direction} trend in {name} is seasonal or a real shift."
     else:
         direction = "flat"
         title = "No clear trend over time"
-        plain = (f"Your {name} activity is roughly flat over time — daily records went "
-                 f"from about {first_c:,} to {last_c:,}, with no clear direction.")
+        plain = (f"{subject} is roughly flat over time — daily records went "
+                 f"from about {_fmt(first_c)} to {_fmt(last_c)}, with no clear direction.")
         next_step = f"Look for seasonality or segment-level movement in {name}; the overall line is flat/noisy."
 
     # evidence: earliest and latest rows in time
@@ -1163,8 +1211,8 @@ def _anomaly_insights(cur, table, numeric, where, params, total, missing_frac, m
         return [_insight(
             id="anomalies", title="Sample too small for outlier detection",
             category="anomalies",
-            explanation=f"Outlier detection needs at least {MIN_OUTLIER_N} rows; only {total} "
-                        "are in scope, so any 'outlier' would be unreliable.",
+            explanation=f"Outlier detection needs at least {_fmt(MIN_OUTLIER_N)} rows; only "
+                        f"{_fmt(total)} are in scope, so any 'outlier' would be unreliable.",
             why_it_matters=_why("anomalies", mode, {}), confidence=0.0, trust_score=0,
             is_limitation=True, what_to_check_next="Gather more rows before flagging outliers.",
             notability=0.0,
@@ -1199,7 +1247,8 @@ def _anomaly_insights(cur, table, numeric, where, params, total, missing_frac, m
             id="anomalies", title="No IQR outliers found", category="anomalies",
             explanation="Your numbers are well-behaved — no value stands out as an extreme "
                         "compared with the rest of its column."
-                        + _tech(mode, f" (checked {len(numeric)} numeric column(s))"),
+                        + _tech(mode, f" (checked {_fmt(len(numeric))} numeric "
+                                      f"{'column' if len(numeric) == 1 else 'columns'})"),
             why_it_matters=_why("anomalies", mode, {}),
             confidence=_confidence(total, 0.5), trust_score=_trust(total, 0.0, 1.0),
             evidence_columns=numeric,
@@ -1222,25 +1271,54 @@ def _anomaly_insights(cur, table, numeric, where, params, total, missing_frac, m
         mn_out, mx_out = cur.execute(
             f"SELECT MIN({ident}), MAX({ident}) FROM {_qi(table)}{_augment(where, c['cond'])}", params
         ).fetchone()
+        # Scores are computed exactly as before; we only READ trust to decide the
+        # copy (never to change the number). A high-trust extreme is real, not a
+        # likely error — say so plainly and flag it so the UI can relabel the badge.
+        trust = _trust(c["cnt"], missing_frac.get(name, 0.0), consistency)
+        rare_but_real = trust >= 80
+        n_out = c["n_out"]
+        single = n_out == 1
+        row_word = "row" if single else "rows"
+        lo_str, hi_str = _fmt(c["q1"]), _fmt(c["q3"])
+        if single:
+            # One value: state it directly and say which side it sits on — never
+            # "they range X–X".
+            above = float(mn_out) >= c["hi"]
+            side = "above" if above else "below"
+            if rare_but_real:
+                explanation = (f"One value is clearly far outside the normal range — "
+                               f"{_fmt(mn_out)}, while the rest sit between {lo_str} and {hi_str}.")
+            else:
+                explanation = (f"One value of {_fmt(mn_out)} stands far {side} the rest, "
+                               f"which sit between {lo_str} and {hi_str}.")
+        else:
+            range_str = f"{_fmt(mn_out)} to {_fmt(mx_out)}"
+            if rare_but_real:
+                explanation = (f"{_fmt(n_out)} values are clearly far outside the normal range — "
+                               f"they range {range_str}, while most sit between {lo_str} and {hi_str}.")
+            else:
+                explanation = (f"{_fmt(n_out)} values in {name} stand out far from the rest — "
+                               f"they range {range_str}, while most sit between {lo_str} and {hi_str}.")
+        explanation += _tech(mode, f" ({c['frac']*100:.1f}% fall outside "
+                                   f"[{_fmt(c['lo'])}, {_fmt(c['hi'])}])")
+        metrics = {"column": name, "method": "IQR 1.5x fence",
+                   "q1": _round(c["q1"], 4), "q3": _round(c["q3"], 4),
+                   "iqr": _round(c["iqr"], 4), "lower_fence": _round(c["lo"], 4),
+                   "upper_fence": _round(c["hi"], 4), "outlier_count": c["n_out"],
+                   "values_checked": c["cnt"], "outlier_pct": round(c["frac"] * 100, 2),
+                   "min_outlier": _round(mn_out, 4), "max_outlier": _round(mx_out, 4)}
+        if rare_but_real:
+            metrics["rare_but_real"] = True
         out.append(_insight(
-            id=f"anomaly_{name}", title=f"{c['n_out']:,} outlier row(s) in {name}",
+            id=f"anomaly_{name}", title=f"{_fmt(n_out)} outlier {row_word} in {name}",
             category="anomalies",
-            explanation=f"{c['n_out']:,} value(s) in {name} stand out far from the rest — "
-                        f"they range {_round(mn_out,2)}–{_round(mx_out,2)}, while most sit "
-                        f"between {_round(c['q1'],2)} and {_round(c['q3'],2)}."
-                        + _tech(mode, f" ({c['frac']*100:.1f}% fall outside "
-                                      f"[{_round(c['lo'],2)}, {_round(c['hi'],2)}])"),
+            explanation=explanation,
             why_it_matters=_why("anomalies", mode, {}),
             confidence=_confidence(c["cnt"], effect),
-            trust_score=_trust(c["cnt"], missing_frac.get(name, 0.0), consistency),
+            trust_score=trust,
             evidence_rows=ev_rows, evidence_columns=[name],
-            supporting_metrics={"column": name, "method": "IQR 1.5x fence",
-                                "q1": _round(c["q1"], 4), "q3": _round(c["q3"], 4),
-                                "iqr": _round(c["iqr"], 4), "lower_fence": _round(c["lo"], 4),
-                                "upper_fence": _round(c["hi"], 4), "outlier_count": c["n_out"],
-                                "values_checked": c["cnt"], "outlier_pct": round(c["frac"] * 100, 2),
-                                "min_outlier": _round(mn_out, 4), "max_outlier": _round(mx_out, 4)},
-            what_to_check_next=f"Open the {c['n_out']} flagged {name} rows and decide keep/cap/fix.",
+            supporting_metrics=metrics,
+            what_to_check_next=f"Open the {_fmt(n_out)} flagged {name} {row_word} and decide keep/cap/fix.",
             notability=effect * 0.9,
         ))
     return out
@@ -1334,14 +1412,19 @@ def _what_changed_insights(cur, table, dates, texts, numeric, where, params, mis
             if (leader_label == top["label"] and leader_label not in (None, "")
                     and second_label not in (None, "") and second_total > 0):
                 lead_pct = (leader_total - second_total) / second_total * 100
-                lead_clause = f" It's now the top {dim}, {lead_pct:.0f}% ahead of '{second_label}'."
+                # Over 200%, a raw "%" reads worse than a multiple ("almost 6×").
+                lead_txt = (f"{_multiple_phrase(lead_pct)} ahead" if lead_pct > 200
+                            else f"{lead_pct:.0f}% ahead")
+                lead_clause = f" It's now the top {dim}, {lead_txt} of '{second_label}'."
                 lead_metrics = {"leader_total": leader_total, "second_total": second_total,
                                 "second_label": second_label, "lead_pct": round(lead_pct, 2)}
+            # A change over 200% likewise reads better as a multiple.
+            change_txt = (f"{_multiple_phrase(pct)} more" if pct > 200 else f"{pct:+.0f}%")
             return [_insight(
                 id="what_changed", title=f"'{top['label']}' changed most in {dim}",
                 category="what_changed_most",
                 explanation=f"'{top['label']}' is the biggest mover in {dim} — it went from "
-                            f"{top['first_half']:,} to {top['second_half']:,} ({pct:+.0f}%), the "
+                            f"{_fmt(top['first_half'])} to {_fmt(top['second_half'])} ({change_txt}), the "
                             f"largest change of any {dim}."
                             + lead_clause
                             + _tech(mode, f" ({top['delta']:+,} rows between the two halves)"),
@@ -1367,11 +1450,13 @@ def _what_changed_insights(cur, table, dates, texts, numeric, where, params, mis
     delta = n_second - n_first
     base = max(1, n_first)
     effect = min(1.0, abs(delta) / base)
+    vpct = 100 * delta / base
+    vol_txt = (f"{_multiple_phrase(vpct)} more" if vpct > 200 else f"{vpct:+.0f}%")
     return [_insight(
         id="what_changed", title="Overall volume shifted between halves",
         category="what_changed_most",
         explanation=f"You have {'more' if delta > 0 else 'less'} data in the later half — "
-                    f"records went from {n_first:,} to {n_second:,}, {100*delta/base:+.0f}%."
+                    f"records went from {_fmt(n_first)} to {_fmt(n_second)}, {vol_txt}."
                     + _tech(mode, f" ({delta:+,} rows between halves)"),
         why_it_matters=_why("what_changed", mode, {}),
         confidence=_confidence(n_first + n_second, effect),
