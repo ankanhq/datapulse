@@ -957,3 +957,21 @@ def test_score_formulas_bounds():
     assert insights_mod._trust(1000, 0.0, 1.0) == 100       # big, clean, consistent
     assert insights_mod._trust(1000, 1.0, 1.0) == 0         # all missing -> zero trust
     assert 0 <= insights_mod._trust(25, 0.1, 0.5) <= 100
+
+
+def test_weak_correlation_is_flagged_all_clear(tmp_path):
+    # A confident "no relationship" is a completed check, not a weak claim. The
+    # scores stay effect-scaled, but the flag lets the UI render the card
+    # neutrally instead of in warning red.
+    import generate_data
+
+    p = tmp_path / "story.csv"
+    generate_data.generate_story(str(p), days=180, seed=7)
+    ds = _paste(p.read_text(), name="story")
+    rep = client.get(f"/datasets/{ds}/insights").json()
+
+    corr = [i for i in rep["insights"]
+            if i["category"] == "correlations" and not i.get("is_limitation")]
+    assert corr, "expected a correlation card on the story sample"
+    assert "unrelated" in corr[0]["title"]
+    assert corr[0]["supporting_metrics"].get("all_clear") is True

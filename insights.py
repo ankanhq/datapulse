@@ -1194,7 +1194,11 @@ def _correlation_insights(cur, table, numeric, where, params, missing_frac, mode
         trust_score=_trust(n, (missing_frac.get(a, 0.0) + missing_frac.get(b, 0.0)) / 2, ar),
         evidence_rows=ev_rows, evidence_columns=[a, b],
         supporting_metrics={"pair": [a, b], "pearson_r": round(r, 4), "r_squared": round(r * r, 4),
-                            "n": n, "strength": strength, "other_strong_pairs": others},
+                            "n": n, "strength": strength, "other_strong_pairs": others,
+                            # An honest "no relationship" is a completed check, not a weak
+                            # claim — scores stay effect-scaled, but this flag lets the UI
+                            # present the card neutrally instead of in warning red.
+                            **({"all_clear": True} if ar < WEAK_CORR else {})},
         what_to_check_next=f"Plot {a} vs {b} and check whether a third variable explains the link.",
         notability=ar,
     )]
