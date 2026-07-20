@@ -1185,11 +1185,16 @@ def _correlation_insights(cur, table, numeric, where, params, missing_frac, mode
     ev_rows = (_rowids(cur, table, where, params, extra_sql=cond, order_by=f"{ia} ASC", limit=4)
                + _rowids(cur, table, where, params, extra_sql=cond, order_by=f"{ia} DESC", limit=4))
     others = [{"pair": [pa, pb], "r": round(pr, 4), "n": pn} for pr, pa, pb, pn in pairs[1:4]]
+    # For a confident non-relationship the default "these move together" copy would
+    # contradict the card — use an honest all-clear framing instead (all modes).
+    why = ("A checked non-relationship is useful too — it stops you from assuming "
+           "one of these metrics drives the other."
+           if ar < WEAK_CORR else _why("correlation", mode, {}))
     return [_insight(
         id="correlation_top", title=f"{a} and {b} are {relation}",
         category="correlations",
         explanation=plain + _tech(mode, f" (r={r:+.2f}, r²={r*r:.2f}, n={n:,})"),
-        why_it_matters=_why("correlation", mode, {}),
+        why_it_matters=why,
         confidence=_confidence(n, ar),
         trust_score=_trust(n, (missing_frac.get(a, 0.0) + missing_frac.get(b, 0.0)) / 2, ar),
         evidence_rows=ev_rows, evidence_columns=[a, b],

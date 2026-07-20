@@ -975,3 +975,5 @@ def test_weak_correlation_is_flagged_all_clear(tmp_path):
     assert corr, "expected a correlation card on the story sample"
     assert "unrelated" in corr[0]["title"]
     assert corr[0]["supporting_metrics"].get("all_clear") is True
+    # why_it_matters must not contradict the "don't move together" claim
+    assert "move together" not in corr[0]["why_it_matters"]
